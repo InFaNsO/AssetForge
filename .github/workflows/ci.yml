@@ -1,0 +1,18 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  core-tests:
+    # Runs the pure-Python core + golden-mesh chain. No Blender / GPU needed because
+    # assetforge.core never imports bpy (see README design rule).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"   # matches Blender 4.1's bundled Python
+      - name: Run core test suite
+        run: python -m unittest discover -s tests -v

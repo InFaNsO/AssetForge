@@ -1,0 +1,38 @@
+# --- Secrets: never commit keys ---
+.env
+.env.*
+secrets.*
+*.secret
+*_key.txt
+
+# --- Blender ---
+*.blend
+*.blend1
+*.blend2
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- Asset pipeline work dirs / generated artifacts ---
+/work/
+/out/
+*.glb
+*.gltf
+!tests/golden/**/*.glb
+!tests/golden/**/*.gltf
+
+# --- OS / editor ---
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
