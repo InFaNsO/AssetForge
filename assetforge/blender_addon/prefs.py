@@ -41,12 +41,38 @@ class AssetForgePreferences(bpy.types.AddonPreferences):
         default=False,
     )
 
+    instant_meshes_path: bpy.props.StringProperty(  # type: ignore
+        name="Instant Meshes executable",
+        description=(
+            "Path to InstantMeshes.exe — the best automated retopo tool for characters. "
+            "Download free from: "
+            "https://instant-meshes.s3.eu-central-1.amazonaws.com/Release/instant-meshes-windows.zip"
+        ),
+        subtype="FILE_PATH",
+        default="",
+    )
+
     def draw(self, context):
         layout = self.layout
-        layout.label(text="API keys are stored locally and never written to assets or the repo.")
+
+        # --- Retopology tools ---
+        box = layout.box()
+        box.label(text="Retopology", icon="MOD_REMESH")
+        row = box.row()
+        row.prop(self, "instant_meshes_path", text="Instant Meshes")
+        if not self.instant_meshes_path:
+            box.label(
+                text="Not set — retopo will use Decimate (lower quality). "
+                     "Download InstantMeshes.exe from the link above.",
+                icon="INFO",
+            )
+
+        # --- API keys ---
+        box = layout.box()
+        box.label(text="Generation API keys (stored locally, never in repo)", icon="KEYINGSET")
         for _secret, (attr, label) in _KEY_FIELDS.items():
-            layout.prop(self, attr, text=label)
-        layout.prop(self, "fall_back_to_env")
+            box.prop(self, attr, text=label)
+        box.prop(self, "fall_back_to_env")
 
 
 class BlenderSecretStore:
