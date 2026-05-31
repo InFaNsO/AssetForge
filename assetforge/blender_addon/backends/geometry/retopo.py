@@ -40,6 +40,9 @@ import bpy
 from assetforge.core.adapter import Backend, Capabilities, RunContext, RunMode
 from assetforge.core.asset_state import AssetState, StageStatus
 
+from assetforge.core.backends.remesh.meshy_remesh import MeshyRemeshBackend, MeshyRemeshError
+from assetforge.core.backends._platform import platform_target
+
 from .instant_meshes import InstantMeshesBackend, InstantMeshesError
 from .utils import apply_single_modifier, ensure_object, set_active
 
@@ -55,8 +58,7 @@ _DEFAULT_PLATFORM = "indie"
 def _target_for(params: dict, faces_before: int) -> int:
     if "target_faces" in params:
         return int(params["target_faces"])
-    platform = params.get("platform", _DEFAULT_PLATFORM)
-    return _PLATFORM_TARGETS.get(platform, _PLATFORM_TARGETS[_DEFAULT_PLATFORM])
+    return platform_target(params.get("platform", _DEFAULT_PLATFORM))
 
 
 class RetopoBackend(Backend):
@@ -65,6 +67,7 @@ class RetopoBackend(Backend):
 
     def __init__(self) -> None:
         self._im = InstantMeshesBackend()
+        self._mr = MeshyRemeshBackend()
 
     def supports_local(self) -> bool:
         return True
@@ -108,23 +111,38 @@ class RetopoBackend(Backend):
 
         used = None
 
-        # 1. Instant Meshes (best quality when configured)
-        im_ok, _ = self._im.is_available(ctx, RunMode.LOCAL)
-        if im_ok:
+        # 1. Meshy Remesh API (best quality — proprietary trained quad remesher)
+        mr_ok, mr_reason = self._mr.is_available(ctx, RunMode.API)
+        if mr_ok:
             try:
-                self._im.run_local(state, params, ctx)
-                obj = bpy.data.objects.get(obj.name) or obj
-                used = "instant_meshes"
-            except InstantMeshesError as exc:
-                print(f"[AssetForge] Instant Meshes failed ({exc}) — using Decimate")
+                self._mr.run_api(state, params, ctx)
+                # Meshy swapped the GLB on disk; clear cached object + re-import
+                state.artifacts.pop("blender_object", None)
+                obj = ensure_object(state)
+                used = "meshy_remesh"
+            except MeshyRemeshError as exc:
+                print(f"[AssetForge] Meshy Remesh failed ({exc}) — trying Instant Meshes")
+        else:
+            print(f"[AssetForge] Meshy Remesh unavailable ({mr_reason})")
 
-        # 2. QuadriFlow (built-in, needs viewport context)
+        # 2. Instant Meshes (best local quality — field-aligned quads)
+        if used is None:
+            im_ok, _ = self._im.is_available(ctx, RunMode.LOCAL)
+            if im_ok:
+                try:
+                    self._im.run_local(state, params, ctx)
+                    obj = bpy.data.objects.get(obj.name) or obj
+                    used = "instant_meshes"
+                except InstantMeshesError as exc:
+                    print(f"[AssetForge] Instant Meshes failed ({exc}) — trying QuadriFlow")
+
+        # 3. QuadriFlow (built-in, needs viewport context)
         if used is None:
             qf = _try_quadriflow(obj, target)
             if qf and len(obj.data.polygons) != faces_before:
                 used = qf
 
-        # 3. Decimate COLLAPSE — the reliable default
+        # 4. Decimate COLLAPSE — always works, shape-preserving
         if used is None:
             _apply_decimate(obj, faces_before, target)
             used = "decimate_collapse"
@@ -138,7 +156,7 @@ class RetopoBackend(Backend):
         faces_final = len(obj.data.polygons)
         print(f"[AssetForge] retopo via {used}: {faces_before:,} → {faces_final:,}")
 
-        state.artifacts["topology"] = "quad" if used in ("instant_meshes", "quadriflow") else "tri"
+        state.artifacts["topology"] = "quad" if used in ("meshy_remesh", "instant_meshes", "quadriflow") else "tri"
         state.artifacts["blender_object"] = obj.name
         state.metadata.setdefault("retopo", {}).update({
             "method": used,
