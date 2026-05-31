@@ -16,9 +16,11 @@ import os
 import bpy
 
 from assetforge.core.adapter import RunContext
-from assetforge.core.asset_state import AssetState, SourceKind
-from assetforge.core.pipeline import Mode, Pipeline
-from assetforge.core.stages import AssetType
+from assetforge.core.asset_state import AssetState, SourceKind, StageStatus
+from assetforge.core.pipeline import Mode, Pipeline, ValidationResult, always_ok
+from assetforge.core.provenance import ProvenanceEntry
+from assetforge.core.resolver import resolve
+from assetforge.core.stages import AssetType, stage as get_stage
 
 from .backends.registry import build_blender_registry
 from .prefs import get_secret_store
@@ -32,13 +34,13 @@ def _registry():
 
 
 # ---------------------------------------------------------------------------
-# State init
+# Shared helpers
 # ---------------------------------------------------------------------------
 
 def _build_fresh_state(context) -> AssetState:
-    """Build an AssetState from the current panel inputs (no saved state)."""
-    source_type  = context.scene.assetforge_source_type
-    source_image = bpy.path.abspath(context.scene.assetforge_source_image or "").strip()
+    """Build a new AssetState from the current panel inputs."""
+    source_type   = context.scene.assetforge_source_type
+    source_image  = bpy.path.abspath(context.scene.assetforge_source_image or "").strip()
     source_prompt = (context.scene.assetforge_source_prompt or "").strip()
 
     if source_type == "image" and source_image and os.path.exists(source_image):
@@ -74,6 +76,39 @@ def _save_state(context, state: AssetState) -> None:
     context.scene[_STATE_PROP] = state.to_json()
 
 
+def _build_ctx_and_params(context) -> tuple:
+    """Shared RunContext + params setup used by both operators."""
+    ctx    = RunContext(secrets=get_secret_store(context), work_dir=bpy.app.tempdir)
+    params: dict = {}
+
+    backend_choice = context.scene.assetforge_gen_backend
+    copilot_glb    = bpy.path.abspath(context.scene.assetforge_copilot_glb or "").strip()
+
+    if copilot_glb and os.path.exists(copilot_glb):
+        ctx.user_choice["generate"] = "copilot3d"
+        params["generate"] = {"downloaded_glb": copilot_glb}
+    elif backend_choice != "auto":
+        ctx.user_choice["generate"] = backend_choice
+
+    return ctx, params
+
+
+def _import_if_needed(state: AssetState) -> None:
+    """Import the generated GLB into the scene if a geometry backend hasn't already."""
+    if state.artifacts.get("blender_object"):
+        return
+    mesh = state.artifacts.get("mesh")
+    if not isinstance(mesh, str):
+        return
+    path = bpy.path.abspath(mesh)
+    if not (os.path.exists(path) and path.lower().endswith((".glb", ".gltf"))):
+        return
+    try:
+        bpy.ops.import_scene.gltf(filepath=path)
+    except Exception as exc:
+        print(f"[AssetForge] could not import {path}: {exc}")
+
+
 # ---------------------------------------------------------------------------
 # Operator: Run to End
 # ---------------------------------------------------------------------------
@@ -81,48 +116,32 @@ def _save_state(context, state: AssetState) -> None:
 class ASSETFORGE_OT_run_to_end(bpy.types.Operator):
     """Run all applicable stages with the resolver's chosen backends."""
 
-    bl_idname = "assetforge.run_to_end"
-    bl_label  = "Run to End"
+    bl_idname  = "assetforge.run_to_end"
+    bl_label   = "Run to End"
     bl_options = {"REGISTER"}
 
     def execute(self, context):
-        state = _load_or_build_state(context)
-        ctx   = RunContext(secrets=get_secret_store(context), work_dir=bpy.app.tempdir)
-        mode  = Mode(context.scene.assetforge_mode)
-        params: dict = {}
+        state      = _load_or_build_state(context)
+        ctx, params = _build_ctx_and_params(context)
+        mode       = Mode(context.scene.assetforge_mode)
 
-        backend_choice = context.scene.assetforge_gen_backend
-        copilot_glb    = bpy.path.abspath(context.scene.assetforge_copilot_glb or "").strip()
-
-        # --- Wire up generation source ---
-        if copilot_glb and os.path.exists(copilot_glb):
-            # Pre-downloaded GLB: always use the Copilot 3D adapter's manual path.
-            ctx.user_choice["generate"] = "copilot3d"
-            params["generate"] = {"downloaded_glb": copilot_glb}
-
-        elif backend_choice != "auto":
-            # User explicitly chose a backend.
-            ctx.user_choice["generate"] = backend_choice
-            if backend_choice == "copilot3d":
-                self.report({"ERROR"},
-                    "Copilot 3D selected but no GLB provided. "
-                    "Download a GLB from Copilot 3D and set the GLB path field.")
-                return {"CANCELLED"}
-
-        # For Tripo / Meshy / Hunyuan the source_ref (image path or prompt) is
-        # already stored in state — the adapters read it from there.
+        if (context.scene.assetforge_gen_backend == "copilot3d"
+                and not params.get("generate", {}).get("downloaded_glb")):
+            self.report({"ERROR"},
+                "Copilot 3D selected but no GLB provided. "
+                "Download a GLB from Copilot 3D and set the GLB path field.")
+            return {"CANCELLED"}
 
         if not state.source_ref:
             self.report({"ERROR"},
-                "No source provided. Set an image path, text prompt, or select "
-                "a mesh object before running.")
+                "No source set. Provide an image, text prompt, or select a mesh.")
             return {"CANCELLED"}
 
         report = Pipeline(_registry(), mode=mode).run(state, ctx, params=params)
         _save_state(context, state)
 
         if report.ok:
-            self._import_if_needed(state)
+            _import_if_needed(state)
             self.report({"INFO"}, "AssetForge: pipeline completed ✓")
         else:
             failed = [r.stage_key for r in report.results if r.status.value == "failed"]
@@ -130,20 +149,69 @@ class ASSETFORGE_OT_run_to_end(bpy.types.Operator):
         print("[AssetForge] run report:\n" + report.summary())
         return {"FINISHED"}
 
-    @staticmethod
-    def _import_if_needed(state) -> None:
-        if state.artifacts.get("blender_object"):
-            return  # already in scene (geometry backends imported it)
-        mesh = state.artifacts.get("mesh")
-        if not isinstance(mesh, str):
-            return
-        path = bpy.path.abspath(mesh)
-        if not (os.path.exists(path) and path.lower().endswith((".glb", ".gltf"))):
-            return
+
+# ---------------------------------------------------------------------------
+# Operator: Run Single Stage
+# ---------------------------------------------------------------------------
+
+class ASSETFORGE_OT_run_stage(bpy.types.Operator):
+    """Run one pipeline stage in isolation."""
+
+    bl_idname  = "assetforge.run_stage"
+    bl_label   = "Run Stage"
+    bl_options = {"REGISTER"}
+
+    stage_key: bpy.props.StringProperty()  # type: ignore
+
+    def execute(self, context):
         try:
-            bpy.ops.import_scene.gltf(filepath=path)
+            s = get_stage(self.stage_key)
+        except KeyError:
+            self.report({"ERROR"}, f"Unknown stage: {self.stage_key!r}")
+            return {"CANCELLED"}
+
+        state       = _load_or_build_state(context)
+        ctx, params = _build_ctx_and_params(context)
+
+        # N/A check
+        if state.status(self.stage_key) == StageStatus.NA:
+            self.report({"WARNING"},
+                f"Stage '{s.name}' is not applicable to "
+                f"asset type '{state.asset_type.value}'")
+            return {"CANCELLED"}
+
+        # Resolve backend
+        reg = _registry()
+        res = resolve(self.stage_key, reg, ctx, state)
+        if not res.ok:
+            self.report({"ERROR"}, f"No backend for '{s.name}': {res.reason}")
+            return {"CANCELLED"}
+
+        # Run
+        state.set_status(self.stage_key, StageStatus.ACTIVE)
+        stage_params = params.get(self.stage_key, {})
+        try:
+            state = res.backend.run(res.mode, state, stage_params, ctx)
         except Exception as exc:
-            print(f"[AssetForge] could not import {path}: {exc}")
+            state.set_status(self.stage_key, StageStatus.FAILED)
+            _save_state(context, state)
+            self.report({"ERROR"}, f"'{s.name}' failed: {exc}")
+            print(f"[AssetForge] {self.stage_key} ERROR: {exc}")
+            return {"FINISHED"}
+
+        state.record(ProvenanceEntry.create(
+            self.stage_key, res.backend.name, res.mode.value, stage_params))
+        state.set_status(self.stage_key, StageStatus.DONE)
+        _save_state(context, state)
+
+        # Import mesh into scene after generate
+        if self.stage_key == "generate":
+            _import_if_needed(state)
+
+        self.report({"INFO"},
+            f"AssetForge: '{s.name}' done  [{res.backend.name} · {res.mode.value}]")
+        print(f"[AssetForge] {self.stage_key} via {res.backend.name}:{res.mode.value} — {res.reason}")
+        return {"FINISHED"}
 
 
 # ---------------------------------------------------------------------------
@@ -165,7 +233,7 @@ class ASSETFORGE_OT_reset_state(bpy.types.Operator):
 
 
 # ---------------------------------------------------------------------------
-# Operator: Open Copilot 3D in browser
+# Operator: Open Copilot 3D
 # ---------------------------------------------------------------------------
 
 class ASSETFORGE_OT_open_copilot(bpy.types.Operator):
@@ -184,6 +252,7 @@ class ASSETFORGE_OT_open_copilot(bpy.types.Operator):
 
 _CLASSES = (
     ASSETFORGE_OT_run_to_end,
+    ASSETFORGE_OT_run_stage,
     ASSETFORGE_OT_reset_state,
     ASSETFORGE_OT_open_copilot,
 )
@@ -207,16 +276,15 @@ def register() -> None:
     )
     bpy.types.Scene.assetforge_source_type = bpy.props.EnumProperty(
         name="Source",
-        description="What to generate from",
         items=[
-            ("image",  "Image",  "Generate from a reference image"),
-            ("text",   "Text",   "Generate from a text prompt"),
+            ("image", "Image", "Generate from a reference image"),
+            ("text",  "Text",  "Generate from a text prompt"),
         ],
         default="image",
     )
     bpy.types.Scene.assetforge_source_image = bpy.props.StringProperty(
         name="Reference image",
-        description="Image to feed to the generation backend (PNG/JPG, single clear subject)",
+        description="Image for image-to-3D (PNG/JPG, single clear subject on clean background)",
         subtype="FILE_PATH",
         default="",
     )
@@ -227,19 +295,18 @@ def register() -> None:
     )
     bpy.types.Scene.assetforge_gen_backend = bpy.props.EnumProperty(
         name="Backend",
-        description="Which generation backend to use",
         items=[
-            ("auto",       "Auto",        "Resolver picks best available (recommended)"),
-            ("copilot3d",  "Copilot 3D",  "Free — download GLB manually then set path below"),
-            ("tripo",      "Tripo",       "Paid — needs Tripo API key in preferences"),
-            ("meshy",      "Meshy",       "Paid — needs Meshy API key in preferences"),
-            ("hunyuan3d",  "Hunyuan3D",   "Paid — needs fal.ai key, highest quality"),
+            ("auto",      "Auto",       "Resolver picks best available (recommended)"),
+            ("copilot3d", "Copilot 3D", "Free — download GLB manually then set path below"),
+            ("tripo",     "Tripo",      "Paid — needs Tripo API key in preferences"),
+            ("meshy",     "Meshy",      "Paid — needs Meshy API key in preferences"),
+            ("hunyuan3d", "Hunyuan3D",  "Paid — needs fal.ai key, highest quality"),
         ],
         default="auto",
     )
     bpy.types.Scene.assetforge_copilot_glb = bpy.props.StringProperty(
         name="Copilot 3D GLB",
-        description="GLB you downloaded from Copilot 3D (free path, no API key needed)",
+        description="GLB downloaded from Copilot 3D (free path, no API key needed)",
         subtype="FILE_PATH",
         default="",
     )
