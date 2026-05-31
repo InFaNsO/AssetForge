@@ -83,6 +83,26 @@ class ASSETFORGE_PT_main(bpy.types.Panel):
         raw   = sc.get(_STATE_PROP)
         state = AssetState.from_json(raw) if raw else None
 
+        # ── Retopo settings ──────────────────────────────────────────────
+        box = layout.box()
+        box.label(text="Retopology Settings", icon="MOD_REMESH")
+        box.prop(sc, "assetforge_platform", text="Platform")
+        box.prop(sc, "assetforge_retopo_mode", text="Mode")
+        if sc.assetforge_retopo_mode == "gentle":
+            platform_info = {
+                "mobile":  "Target: ~5 000 tris",
+                "indie":   "Target: ~12 000 tris",
+                "console": "Target: ~30 000 tris",
+            }
+            box.label(text=platform_info.get(sc.assetforge_platform, ""),
+                      icon="INFO")
+            box.label(text="Complex characters may need manual cleanup",
+                      icon="ERROR")
+        else:
+            box.label(text="Retopo the mesh manually, then ▶ the next stage",
+                      icon="INFO")
+
+        # ── Stage Rail ───────────────────────────────────────────────────
         box = layout.box()
         header = box.row()
         header.label(text="Pipeline Stages", icon="NODETREE")

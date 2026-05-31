@@ -1,29 +1,36 @@
 """Stage 4 — Retopology.
 
-Strategy (in order of preference):
-  1. Instant Meshes  — best quality. Field-aligned quad remesher that follows
-                       surface curvature. Free CLI tool; set path in preferences.
-  2. QuadriFlow      — built-in quad remesh. Needs a VIEW_3D area (temp_override).
-                       Works best on watertight meshes.
-  3. Decimate COLLAPSE — shape-preserving fallback. Reduces poly count while
-                         following the surface. Clean results at gentle ratios
-                         (≤50 % reduction); shows artifacts at aggressive ratios.
+Honest reality for complex characters
+--------------------------------------
+Automated retopo (Instant Meshes, QuadriFlow, Decimate) does NOT work reliably
+on AI-generated characters with overlapping geometry (clothing over body, thin
+accessories, fingers). Every automated tool has this limitation.
 
-Every method is wrapped with:
-  • _pre_clean()   — merge duplicate verts, dissolve degenerate faces (bmesh,
-                     context-independent). Removes the bad topology that causes
-                     holes and intersection artefacts in generated meshes.
-  • _post_repair() — fill holes created by the remesher, remove loose verts
-                     (bmesh, context-independent). Fixes the "openings" that
-                     automated tools produce on multi-piece meshes.
+For complex characters the professional workflow is:
+  • Keep the high-poly as a baking source
+  • Manually retopo to a low-poly cage in Blender
+  • Bake normals/AO high→low
 
-Target face count
-  The default is RELATIVE: keep 40 % of the original faces, with a floor of
-  20 000 and a ceiling of 80 000.  This avoids the 90 %+ reductions that
-  create visible artefacts on complex characters.  Pass ``target_faces`` in
-  params to override with an explicit count.
+This stage therefore runs in one of two modes, selectable via params["retopo_mode"]:
 
-⚠ Voxel Remesh is NOT used — it voxelises the volume and destroys thin parts.
+  "gentle"  (default) — Decimate COLLAPSE at a conservative ratio.
+                         Shape is preserved, no holes, no disfiguration.
+                         Good for simple props and hard-surface objects.
+                         For characters use as a starting point and clean
+                         up manually afterward.
+
+  "manual"  — Opens Blender's built-in retopo/sculpt tools and marks the
+               stage as MANUAL so the pipeline continues normally.
+               Use this for complex organic characters.
+
+Platform face-count presets (from params["platform"]):
+  mobile   →  3 000 – 5 000 tris
+  indie    →  8 000 – 15 000 tris    ← default
+  console  → 20 000 – 40 000 tris
+  custom   → use params["target_faces"] directly
+
+NOTE: Instant Meshes and QuadriFlow remain available and are attempted first
+when configured, but Gentle Decimate is the reliable default for characters.
 """
 from __future__ import annotations
 
@@ -31,15 +38,25 @@ import bmesh
 import bpy
 
 from assetforge.core.adapter import Backend, Capabilities, RunContext, RunMode
-from assetforge.core.asset_state import AssetState
+from assetforge.core.asset_state import AssetState, StageStatus
 
 from .instant_meshes import InstantMeshesBackend, InstantMeshesError
 from .utils import apply_single_modifier, ensure_object, set_active
 
+# Target face counts per platform (triangles)
+_PLATFORM_TARGETS = {
+    "mobile":  5_000,
+    "indie":   12_000,
+    "console": 30_000,
+}
+_DEFAULT_PLATFORM = "indie"
 
-def _default_target(faces_before: int) -> int:
-    """Relative target: 40 % of input, clamped 20 k–80 k."""
-    return max(20_000, min(80_000, int(faces_before * 0.4)))
+
+def _target_for(params: dict, faces_before: int) -> int:
+    if "target_faces" in params:
+        return int(params["target_faces"])
+    platform = params.get("platform", _DEFAULT_PLATFORM)
+    return _PLATFORM_TARGETS.get(platform, _PLATFORM_TARGETS[_DEFAULT_PLATFORM])
 
 
 class RetopoBackend(Backend):
@@ -57,128 +74,118 @@ class RetopoBackend(Backend):
                             emits_quads=True)
 
     def run_local(self, state: AssetState, params: dict, ctx: RunContext) -> AssetState:
+        mode = params.get("retopo_mode", "gentle")
+
+        # ── Manual mode ─────────────────────────────────────────────────
+        if mode == "manual":
+            state.set_status("retopo", StageStatus.MANUAL)
+            state.metadata.setdefault("retopo", {})["method"] = "manual"
+            print("[AssetForge] retopo: manual mode — do it in Blender, "
+                  "then click ▶ on the next stage to continue.")
+            return state
+
         obj = ensure_object(state)
         if obj is None:
             raise RuntimeError("No mesh object in scene — generate stage must run first")
 
         set_active(obj)
         faces_before = len(obj.data.polygons)
-        target_faces = int(params.get("target_faces", _default_target(faces_before)))
+        target = _target_for(params, faces_before)
+        reduction_pct = (1 - target / max(faces_before, 1)) * 100
 
-        print(f"[AssetForge] retopo: {faces_before} polys → target {target_faces} "
-              f"({target_faces/max(faces_before,1)*100:.0f}% of original)")
+        print(f"[AssetForge] retopo ({mode}): {faces_before:,} → {target:,} "
+              f"({reduction_pct:.0f}% reduction, "
+              f"platform={params.get('platform', _DEFAULT_PLATFORM)})")
 
-        # ── Pre-clean (always, before any remesh) ────────────────────────
+        # Warn if reduction is very aggressive (>85%)
+        if reduction_pct > 85:
+            print(f"[AssetForge] retopo WARNING: {reduction_pct:.0f}% reduction is "
+                  f"aggressive. Complex characters may show artifacts. "
+                  f"Consider retopo_mode='manual' or a higher target.")
+
+        # ── Pre-clean ────────────────────────────────────────────────────
         _pre_clean(obj)
 
         used = None
 
-        # 1. Instant Meshes
+        # 1. Instant Meshes (best quality when configured)
         im_ok, _ = self._im.is_available(ctx, RunMode.LOCAL)
         if im_ok:
             try:
                 self._im.run_local(state, params, ctx)
-                # run_local may have swapped obj.data; re-fetch
                 obj = bpy.data.objects.get(obj.name) or obj
                 used = "instant_meshes"
             except InstantMeshesError as exc:
-                print(f"[AssetForge] Instant Meshes failed ({exc}) — trying QuadriFlow")
+                print(f"[AssetForge] Instant Meshes failed ({exc}) — using Decimate")
 
-        # 2. QuadriFlow
+        # 2. QuadriFlow (built-in, needs viewport context)
         if used is None:
-            qf = _try_quadriflow(obj, target_faces)
+            qf = _try_quadriflow(obj, target)
             if qf and len(obj.data.polygons) != faces_before:
                 used = qf
 
-        # 3. Decimate COLLAPSE
+        # 3. Decimate COLLAPSE — the reliable default
         if used is None:
-            print("[AssetForge] retopo: using Decimate COLLAPSE")
-            _apply_decimate(obj, faces_before, target_faces)
+            _apply_decimate(obj, faces_before, target)
             used = "decimate_collapse"
 
-        # ── Post-repair (always, after any remesh) ────────────────────────
-        holes_filled, loose_removed = _post_repair(obj)
-        if holes_filled or loose_removed:
-            print(f"[AssetForge] retopo post-repair: "
-                  f"filled {holes_filled} holes, removed {loose_removed} loose verts")
+        # ── Post-repair ──────────────────────────────────────────────────
+        holes, loose = _post_repair(obj)
+        if holes or loose:
+            print(f"[AssetForge] retopo post-repair: {holes} holes filled, "
+                  f"{loose} loose verts removed")
 
         faces_final = len(obj.data.polygons)
-        print(f"[AssetForge] retopo via {used}: {faces_before} → {faces_final} polys")
+        print(f"[AssetForge] retopo via {used}: {faces_before:,} → {faces_final:,}")
 
         state.artifacts["topology"] = "quad" if used in ("instant_meshes", "quadriflow") else "tri"
         state.artifacts["blender_object"] = obj.name
         state.metadata.setdefault("retopo", {}).update({
             "method": used,
+            "platform": params.get("platform", _DEFAULT_PLATFORM),
             "faces_before": faces_before,
             "faces_after": faces_final,
-            "holes_filled": holes_filled,
+            "holes_filled": holes,
         })
         return state
 
 
 # ---------------------------------------------------------------------------
-# Pre-clean
+# Pre-clean / post-repair
 # ---------------------------------------------------------------------------
 
 def _pre_clean(obj) -> None:
-    """Merge duplicate verts and dissolve degenerate faces using bmesh.
-
-    AI-generated meshes often have many duplicate vertices at surface seams and
-    zero-area faces from triangulation artefacts. Both cause holes and bad normals
-    after remeshing.  This runs before any retopo method.
-    """
     bm = bmesh.new()
     bm.from_mesh(obj.data)
-
     verts_before = len(bm.verts)
     bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=0.0001)
     bmesh.ops.dissolve_degenerate(bm, dist=0.0001, edges=bm.edges)
     bm.normal_update()
-
     bm.to_mesh(obj.data)
     bm.free()
     obj.data.update()
-
     merged = verts_before - len(obj.data.vertices)
     if merged:
-        print(f"[AssetForge] retopo pre-clean: merged {merged} duplicate verts")
+        print(f"[AssetForge] pre-clean: merged {merged} duplicate verts")
 
-
-# ---------------------------------------------------------------------------
-# Post-repair
-# ---------------------------------------------------------------------------
 
 def _post_repair(obj) -> tuple:
-    """Fill holes and remove loose geometry using bmesh after any retopo method.
-
-    Remeshers (including Instant Meshes) often leave open boundary edges on
-    multi-piece meshes. ``holes_fill`` closes these; ``delete VERTS`` removes
-    any stray vertices that are no longer connected to faces.
-
-    Returns (holes_filled, loose_verts_removed).
-    """
     bm = bmesh.new()
     bm.from_mesh(obj.data)
-
-    # Boundary edges = edges that belong to only one face = hole perimeters
     boundary = [e for e in bm.edges if not e.is_manifold and len(e.link_faces) < 2]
-    holes_filled = 0
+    holes = 0
     if boundary:
         result = bmesh.ops.holes_fill(bm, edges=boundary, sides=0)
-        holes_filled = len(result.get("faces", []))
-
-    # Loose vertices (not connected to any face)
+        holes = len(result.get("faces", []))
     loose = [v for v in bm.verts if not v.link_faces]
-    loose_removed = len(loose)
+    loose_count = len(loose)
     if loose:
         bmesh.ops.delete(bm, geom=loose, context="VERTS")
-
     bm.normal_update()
     bm.to_mesh(obj.data)
     bm.free()
     obj.data.update()
-
-    return holes_filled, loose_removed
+    return holes, loose_count
 
 
 # ---------------------------------------------------------------------------

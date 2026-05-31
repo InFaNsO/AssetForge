@@ -90,6 +90,12 @@ def _build_ctx_and_params(context) -> tuple:
     elif backend_choice != "auto":
         ctx.user_choice["generate"] = backend_choice
 
+    # Retopo settings — passed to the retopo backend
+    params["retopo"] = {
+        "retopo_mode": context.scene.assetforge_retopo_mode,
+        "platform":    context.scene.assetforge_platform,
+    }
+
     return ctx, params
 
 
@@ -310,6 +316,25 @@ def register() -> None:
         subtype="FILE_PATH",
         default="",
     )
+    bpy.types.Scene.assetforge_retopo_mode = bpy.props.EnumProperty(
+        name="Retopo mode",
+        items=[
+            ("gentle", "Gentle (auto)",
+             "Automated Decimate — works well for props, may show artifacts on characters"),
+            ("manual", "Manual",
+             "Mark the stage as manual so you retopo by hand in Blender — best for characters"),
+        ],
+        default="gentle",
+    )
+    bpy.types.Scene.assetforge_platform = bpy.props.EnumProperty(
+        name="Platform target",
+        items=[
+            ("mobile",  "Mobile",  "3 000–5 000 tris"),
+            ("indie",   "Indie",   "8 000–15 000 tris"),
+            ("console", "Console", "20 000–40 000 tris"),
+        ],
+        default="indie",
+    )
     for c in _CLASSES:
         bpy.utils.register_class(c)
 
@@ -319,6 +344,7 @@ def unregister() -> None:
         bpy.utils.unregister_class(c)
     for prop in ("assetforge_asset_type", "assetforge_mode", "assetforge_source_type",
                  "assetforge_source_image", "assetforge_source_prompt",
-                 "assetforge_gen_backend", "assetforge_copilot_glb"):
+                 "assetforge_gen_backend", "assetforge_copilot_glb",
+                 "assetforge_retopo_mode", "assetforge_platform"):
         if hasattr(bpy.types.Scene, prop):
             delattr(bpy.types.Scene, prop)
