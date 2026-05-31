@@ -1,10 +1,12 @@
 """Stage 10 — LOD chain. Creates 3 levels of detail as separate scene objects (Option A).
 
 Naming convention (matches Unreal Engine LOD import convention):
-    {base}_LOD0  — original (alias only, the base object itself)
+    {base}       — original (LOD0 — full detail)
     {base}_LOD1  — 50 % faces
     {base}_LOD2  — 25 % faces
     {base}_LOD3  — 10 % faces
+
+All modifier applications use the depsgraph method (no 3D-viewport context needed).
 """
 from __future__ import annotations
 
@@ -13,7 +15,7 @@ import bpy
 from assetforge.core.adapter import Backend, Capabilities, RunContext, RunMode
 from assetforge.core.asset_state import AssetState
 
-from .utils import apply_modifiers, duplicate_object, ensure_object, set_active
+from .utils import apply_modifiers, apply_single_modifier, duplicate_object, ensure_object, set_active
 
 _DEFAULT_RATIOS = [0.5, 0.25, 0.10]
 
@@ -35,31 +37,28 @@ class LODBackend(Backend):
 
         ratios: list[float] = list(params.get("ratios", _DEFAULT_RATIOS))
         base_name = obj.name
+        base_faces = len(obj.data.polygons)
         lod_names: list[str] = []
 
         for i, ratio in enumerate(ratios, start=1):
             lod_name = f"{base_name}_LOD{i}"
-            # Remove stale LOD with same name if re-running
             if lod_name in bpy.data.objects:
                 bpy.data.objects.remove(bpy.data.objects[lod_name], do_unlink=True)
 
             dup = duplicate_object(obj, lod_name)
-            # Apply any existing modifiers before adding Decimate
+            # Flatten any existing modifiers first, then add Decimate
             apply_modifiers(dup)
 
-            mod = dup.modifiers.new("Decimate", "DECIMATE")
+            mod = dup.modifiers.new("AF_Decimate", "DECIMATE")
             mod.decimate_type = "COLLAPSE"
             mod.ratio = ratio
-            bpy.context.view_layer.objects.active = dup
-            bpy.ops.object.modifier_apply(modifier=mod.name)
+            apply_single_modifier(dup, mod)   # depsgraph — no viewport context needed
 
-            # Place LOD objects in a collection for tidiness
             _move_to_lod_collection(dup)
-
-            print(f"[AssetForge] LOD{i}: {lod_name} ({ratio*100:.0f}%)")
+            lod_faces = len(dup.data.polygons)
+            print(f"[AssetForge] LOD{i}: {lod_name}  {base_faces} → {lod_faces} polys ({ratio*100:.0f}%)")
             lod_names.append(lod_name)
 
-        # Return to original as active
         set_active(obj)
         state.artifacts["lods"] = lod_names
         state.artifacts["blender_object"] = base_name

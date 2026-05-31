@@ -9,11 +9,7 @@ from assetforge.core.asset_state import AssetState
 
 
 def ensure_object(state: AssetState):
-    """Return the working Blender mesh object, importing from the mesh artifact if needed.
-
-    The first geometry backend to run will import the GLB; subsequent backends just look
-    up the stored object name. Never imports twice.
-    """
+    """Return the working Blender mesh object, importing from the mesh artifact if needed."""
     name = state.artifacts.get("blender_object")
     if name and name in bpy.data.objects and bpy.data.objects[name].type == "MESH":
         return bpy.data.objects[name]
@@ -50,6 +46,39 @@ def set_active(obj) -> None:
         bpy.ops.object.mode_set(mode="OBJECT")
 
 
+def apply_modifiers(obj) -> None:
+    """Apply ALL modifiers on *obj* without needing a 3D-viewport operator context.
+
+    Uses the depsgraph evaluation method (Blender 2.90+) which works from any
+    Python/operator context — no ``bpy.ops.object.modifier_apply()`` needed.
+    """
+    if not obj.modifiers:
+        return
+    set_active(obj)
+    depsgraph = bpy.context.evaluated_depsgraph_get()
+    obj_eval  = obj.evaluated_get(depsgraph)
+    new_mesh  = bpy.data.meshes.new_from_object(obj_eval)
+    old_mesh  = obj.data
+    obj.data  = new_mesh
+    obj.modifiers.clear()
+    if old_mesh.users == 0:
+        bpy.data.meshes.remove(old_mesh)
+
+
+def apply_single_modifier(obj, mod) -> None:
+    """Apply one modifier and remove it using the depsgraph method."""
+    # Evaluate with the modifier active, swap mesh, then remove modifier
+    set_active(obj)
+    depsgraph = bpy.context.evaluated_depsgraph_get()
+    obj_eval  = obj.evaluated_get(depsgraph)
+    new_mesh  = bpy.data.meshes.new_from_object(obj_eval)
+    old_mesh  = obj.data
+    obj.data  = new_mesh
+    obj.modifiers.remove(mod)
+    if old_mesh.users == 0:
+        bpy.data.meshes.remove(old_mesh)
+
+
 def duplicate_object(obj, new_name: str):
     """Return a linked-data-free copy of *obj* named *new_name*."""
     set_active(obj)
@@ -58,12 +87,3 @@ def duplicate_object(obj, new_name: str):
     dup.name = new_name
     dup.data.name = new_name
     return dup
-
-
-def apply_modifiers(obj) -> None:
-    set_active(obj)
-    for mod in list(obj.modifiers):
-        try:
-            bpy.ops.object.modifier_apply(modifier=mod.name)
-        except Exception:
-            obj.modifiers.remove(mod)
