@@ -143,12 +143,13 @@ def _run_instant_meshes(exe: str, in_obj: str, out_obj: str,
     cmd = [
         exe,
         in_obj,
-        "--output",  out_obj,
-        "--faces",   str(faces),
-        "--rosy",    "4",    # 4-RoSy field → quad-dominant output
-        "--posy",    "4",    # 4-PoSy positioning
-        "--smooth",  str(smooth),
-        "--crease",  str(int(crease)),
+        "--output",     out_obj,
+        "--faces",      str(faces),
+        "--rosy",       "4",          # 4-RoSy field → quad-dominant output
+        "--posy",       "4",          # 4-PoSy positioning
+        "--smooth",     str(smooth),
+        "--crease",     str(int(crease)),
+        "--boundaries",               # align to and preserve boundary edges
     ]
     if deterministic:
         cmd.append("--deterministic")
