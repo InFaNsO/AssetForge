@@ -6,6 +6,8 @@ Real backends are registered here as they land in Phases 1-6.
 """
 from __future__ import annotations
 
+import os
+
 import bpy
 
 from assetforge.core.adapter import RunContext
@@ -55,16 +57,44 @@ class ASSETFORGE_OT_run_to_end(bpy.types.Operator):
         state = _load_or_init_state(context)
         ctx = RunContext(secrets=get_secret_store(context), work_dir=bpy.app.tempdir)
         mode = Mode(context.scene.assetforge_mode)
-        report = Pipeline(_registry(), mode=mode).run(state, ctx)
+
+        # If the user pointed us at a GLB they downloaded from Copilot 3D, use the free
+        # manual generation path. Otherwise the resolver picks (Copilot automation / Tripo).
+        params = {}
+        glb = (context.scene.assetforge_copilot_glb or "").strip()
+        if glb:
+            ctx.user_choice["generate"] = "copilot3d"
+            params["generate"] = {"downloaded_glb": bpy.path.abspath(glb)}
+
+        report = Pipeline(_registry(), mode=mode).run(state, ctx, params=params)
         _save_state(context, state)
 
         if report.ok:
+            self._import_generated_mesh(state)
             self.report({"INFO"}, "AssetForge: chain completed")
         else:
             failed = [r.stage_key for r in report.results if r.status.value == "failed"]
             self.report({"WARNING"}, f"AssetForge: stopped at {', '.join(failed) or '?'}")
         print("[AssetForge] run report:\n" + report.summary())
         return {"FINISHED"}
+
+    @staticmethod
+    def _import_generated_mesh(state) -> None:
+        """Import the generated GLB into the scene so the result is visible.
+
+        Best-effort: downstream geometry stages are still placeholders (Phase 2), so this
+        is currently the one stage that produces a real, viewable artifact.
+        """
+        mesh = state.artifacts.get("mesh")
+        if not isinstance(mesh, str):
+            return
+        path = bpy.path.abspath(mesh)
+        if not (os.path.exists(path) and path.lower().endswith((".glb", ".gltf"))):
+            return
+        try:
+            bpy.ops.import_scene.gltf(filepath=path)
+        except Exception as exc:  # don't fail the run over a viewer-only import
+            print(f"[AssetForge] could not import {path}: {exc}")
 
 
 class ASSETFORGE_OT_reset_state(bpy.types.Operator):
@@ -96,6 +126,12 @@ def register() -> None:
                ("expert", "Expert", "Warn and continue")],
         default="guided",
     )
+    bpy.types.Scene.assetforge_copilot_glb = bpy.props.StringProperty(
+        name="Copilot 3D GLB",
+        description="Optional: a GLB you downloaded from Copilot 3D (free generation path)",
+        subtype="FILE_PATH",
+        default="",
+    )
     for c in _CLASSES:
         bpy.utils.register_class(c)
 
@@ -105,3 +141,4 @@ def unregister() -> None:
         bpy.utils.unregister_class(c)
     del bpy.types.Scene.assetforge_asset_type
     del bpy.types.Scene.assetforge_mode
+    del bpy.types.Scene.assetforge_copilot_glb

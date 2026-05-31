@@ -32,6 +32,7 @@ class ASSETFORGE_PT_main(bpy.types.Panel):
         layout = self.layout
         layout.prop(context.scene, "assetforge_asset_type")
         layout.prop(context.scene, "assetforge_mode")
+        layout.prop(context.scene, "assetforge_copilot_glb")
 
         raw = context.scene.get(_STATE_PROP)
         state = AssetState.from_json(raw) if raw else None
