@@ -1,0 +1,69 @@
+"""Shared bpy helpers used by every geometry backend."""
+from __future__ import annotations
+
+import os
+
+import bpy
+
+from assetforge.core.asset_state import AssetState
+
+
+def ensure_object(state: AssetState):
+    """Return the working Blender mesh object, importing from the mesh artifact if needed.
+
+    The first geometry backend to run will import the GLB; subsequent backends just look
+    up the stored object name. Never imports twice.
+    """
+    name = state.artifacts.get("blender_object")
+    if name and name in bpy.data.objects and bpy.data.objects[name].type == "MESH":
+        return bpy.data.objects[name]
+
+    mesh_path = state.artifacts.get("mesh")
+    if not mesh_path:
+        return None
+    path = str(mesh_path)
+    if not os.path.exists(path):
+        return None
+
+    bpy.ops.object.select_all(action="DESELECT")
+    ext = os.path.splitext(path)[1].lower()
+    if ext in (".glb", ".gltf"):
+        bpy.ops.import_scene.gltf(filepath=path)
+    else:
+        return None
+
+    mesh_objs = [o for o in bpy.context.selected_objects if o.type == "MESH"]
+    if not mesh_objs:
+        return None
+
+    obj = max(mesh_objs, key=lambda o: len(o.data.vertices))
+    state.artifacts["blender_object"] = obj.name
+    return obj
+
+
+def set_active(obj) -> None:
+    """Make *obj* the active and only-selected object in OBJECT mode."""
+    bpy.ops.object.select_all(action="DESELECT")
+    obj.select_set(True)
+    bpy.context.view_layer.objects.active = obj
+    if bpy.context.mode != "OBJECT":
+        bpy.ops.object.mode_set(mode="OBJECT")
+
+
+def duplicate_object(obj, new_name: str):
+    """Return a linked-data-free copy of *obj* named *new_name*."""
+    set_active(obj)
+    bpy.ops.object.duplicate(linked=False)
+    dup = bpy.context.active_object
+    dup.name = new_name
+    dup.data.name = new_name
+    return dup
+
+
+def apply_modifiers(obj) -> None:
+    set_active(obj)
+    for mod in list(obj.modifiers):
+        try:
+            bpy.ops.object.modifier_apply(modifier=mod.name)
+        except Exception:
+            obj.modifiers.remove(mod)

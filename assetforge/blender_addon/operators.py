@@ -12,10 +12,10 @@ import bpy
 
 from assetforge.core.adapter import RunContext
 from assetforge.core.asset_state import AssetState, SourceKind
-from assetforge.core.backends.registry import build_default_registry
 from assetforge.core.pipeline import Mode, Pipeline
 from assetforge.core.stages import AssetType
 
+from .backends.registry import build_blender_registry
 from .prefs import get_secret_store
 
 # Scene-stored asset state lives as JSON so it survives save/load (the contract is
@@ -24,9 +24,8 @@ _STATE_PROP = "assetforge_state_json"
 
 
 def _registry():
-    # Single place to assemble the backend registry. Real generation backends (Copilot 3D
-    # + Tripo) with algorithmic placeholders downstream until Phase 2 (registry.py).
-    return build_default_registry()
+    # Phase 2: real generation backends + real bpy geometry algorithms (blender registry).
+    return build_blender_registry()
 
 
 def _load_or_init_state(context) -> AssetState:
@@ -80,11 +79,14 @@ class ASSETFORGE_OT_run_to_end(bpy.types.Operator):
 
     @staticmethod
     def _import_generated_mesh(state) -> None:
-        """Import the generated GLB into the scene so the result is visible.
+        """Import the generated GLB if the geometry backends didn't already do so.
 
-        Best-effort: downstream geometry stages are still placeholders (Phase 2), so this
-        is currently the one stage that produces a real, viewable artifact.
+        In Phase 2+ the retopo/UV/etc. backends call ensure_object() which imports the
+        mesh during the pipeline run and stores the object name. In that case we skip
+        re-importing to avoid duplicates.
         """
+        if state.artifacts.get("blender_object"):
+            return   # already imported by a geometry backend
         mesh = state.artifacts.get("mesh")
         if not isinstance(mesh, str):
             return
@@ -93,7 +95,7 @@ class ASSETFORGE_OT_run_to_end(bpy.types.Operator):
             return
         try:
             bpy.ops.import_scene.gltf(filepath=path)
-        except Exception as exc:  # don't fail the run over a viewer-only import
+        except Exception as exc:
             print(f"[AssetForge] could not import {path}: {exc}")
 
 

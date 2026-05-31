@@ -37,7 +37,9 @@ class Copilot3DBackend(Backend):
         return True, "free (browser session)"
 
     def run_automation(self, state: AssetState, params: dict, ctx: RunContext) -> AssetState:
-        if state.source_kind.value != "image":
+        # When downloaded_glb is provided the driver ignores image_path entirely —
+        # no source_kind check needed. The check only applies to live browser generation.
+        if not params.get("downloaded_glb") and state.source_kind.value != "image":
             raise GenerationPending("Copilot 3D needs an image input (source_kind=image).")
         driver_params = dict(params)
         driver_params.setdefault("asset_id", state.id)
