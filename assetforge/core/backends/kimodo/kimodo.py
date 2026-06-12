@@ -113,19 +113,31 @@ class KimodoBackend(Backend):
 
     def is_available(self, ctx: RunContext, mode: RunMode):
         url = _get_url(ctx)
+        # Modal HTTPS cold starts can take 30-60 s; use a longer probe timeout
+        # for remote URLs vs the local Docker container.
+        timeout = 5 if url.startswith("http://localhost") else 15
         try:
             req = urllib.request.Request(f"{url}/health", method="GET")
-            with urllib.request.urlopen(req, timeout=3) as resp:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
                 if resp.status == 200:
                     return True, f"Kimodo running at {url}"
         except Exception:
             pass
-        return False, (
-            f"Kimodo not reachable at {url}. "
-            "Start it with: docker run -p 9551:9551 -e HF_TOKEN=<token> "
-            "-e TEXT_ENCODER_DEVICE=cpu --gpus=all "
-            "ghcr.io/eyalenav/kimodo-api:latest"
-        )
+        is_modal = "modal.run" in url
+        if is_modal:
+            hint = (
+                f"Kimodo Modal endpoint not responding at {url}. "
+                "Deploy with: modal deploy assetforge/modal/kimodo_app.py  "
+                "then set ASSETFORGE_KIMODO_URL to the printed URL."
+            )
+        else:
+            hint = (
+                f"Kimodo not reachable at {url}. "
+                "Start it with: docker run -p 9551:9551 -e HF_TOKEN=<token> "
+                "-e TEXT_ENCODER_DEVICE=cpu --gpus=all "
+                "ghcr.io/eyalenav/kimodo-api:latest"
+            )
+        return False, hint
 
     def run_local(self, state: AssetState, params: dict, ctx: RunContext) -> AssetState:
         prompt = params.get("motion_prompt", "")
@@ -159,8 +171,12 @@ def _call_kimodo(base_url: str, prompt: str) -> bytes:
     req = urllib.request.Request(
         f"{base_url}/generate", data=body, method="POST")
     req.add_header("Content-Type", "application/json")
+    # Modal cold start + model load + generation can exceed 2 min on first call;
+    # local Docker is fast, but using a generous timeout hurts nothing.
+    is_modal = "modal.run" in base_url
+    timeout = 600 if is_modal else 180
     try:
-        with urllib.request.urlopen(req, timeout=120) as resp:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             return resp.read()
     except urllib.error.HTTPError as exc:
         raise KimodoError(f"Kimodo returned HTTP {exc.code}: {exc.read().decode()}") from exc

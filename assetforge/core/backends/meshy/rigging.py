@@ -59,15 +59,27 @@ class MeshyRiggingBackend(Backend):
             "height_meters": float(params.get("height_meters", 1.7)),
         }
 
-        # Input: prefer Meshy task ID from retexture or generation
+        # Input priority:
+        # 1. Retexture task_id (Meshy retexture output is already a clean textured mesh)
+        # 2. Retopo'd local GLB — if Meshy remesh was done, that mesh is what we want to rig;
+        #    bypass the generation task_id since Meshy rigging rejects generation tasks that
+        #    have had their topology changed by a subsequent remesh call.
+        # 3. Generation task_id (only when no retopo has been done)
+        # 4. Any other local mesh path
         retex_id = state.metadata.get("texture", {}).get("task_id")
+        retopo_done = state.metadata.get("retopo", {}).get("method") == "meshy_remesh"
         gen_id = state.metadata.get("generation", {}).get("task_id")
+        mesh_path = str(state.artifacts.get("mesh", ""))
+
         if retex_id:
             body["input_task_id"] = retex_id
+        elif retopo_done and mesh_path and os.path.exists(mesh_path):
+            # Upload the retopo'd GLB directly — it is the mesh we intend to rig
+            print(f"[AssetForge] Meshy Rigging: uploading retopo'd GLB as data URI")
+            body["model_url"] = _to_data_uri(mesh_path)
         elif (state.metadata.get("generation", {}).get("backend") == "meshy" and gen_id):
             body["input_task_id"] = gen_id
         else:
-            mesh_path = str(state.artifacts.get("mesh", ""))
             if not mesh_path or not os.path.exists(mesh_path):
                 raise MeshyError("no mesh artifact — run generate + texture stages first")
             body["model_url"] = _to_data_uri(mesh_path)
@@ -77,26 +89,29 @@ class MeshyRiggingBackend(Backend):
         if not task_id:
             raise MeshyError(f"rigging task creation failed: {created}")
 
-        result = self.client.poll("rigging", api_key, task_id,
-                                   self.poll_interval, self.timeout_s)
+        task_data = self.client.poll("rigging", api_key, task_id,
+                                     self.poll_interval, self.timeout_s)
+        # Meshy task response wraps output under a nested "result" key
+        task_result = task_data.get("result") or {}
 
-        glb_url = result.get("rigged_character_glb_url")
+        glb_url = task_result.get("rigged_character_glb_url")
         if not glb_url:
-            raise MeshyError(f"rigging succeeded but no GLB URL: {result}")
+            raise MeshyError(f"rigging succeeded but no GLB URL: {task_data}")
 
         dest = os.path.join(ctx.work_dir, f"{state.id}_rigged.glb")
         self.client.download(glb_url, dest)
         state.artifacts["mesh"] = dest
         state.artifacts["skeleton"] = "mixamo"
 
-        # Also download the included walk/run animations
-        basic = result.get("basic_animations", {})
+        # Basic animations: flat dict with keys like walking_glb_url / running_glb_url.
+        # Skip armature-only exports (walking_armature_glb_url) — we only want skinned GLBs.
+        basic = task_result.get("basic_animations", {})
         anims = {}
-        for motion, formats in basic.items():
-            glb = (formats or {}).get("glb")
-            if glb:
+        for key, url in basic.items():
+            if key.endswith("_glb_url") and "_armature_" not in key and url:
+                motion = key[: -len("_glb_url")]   # "walking_glb_url" -> "walking"
                 adest = os.path.join(ctx.work_dir, f"{state.id}_anim_{motion}.glb")
-                self.client.download(glb, adest)
+                self.client.download(url, adest)
                 anims[motion] = adest
         if anims:
             state.artifacts.setdefault("animations", {}).update(anims)
