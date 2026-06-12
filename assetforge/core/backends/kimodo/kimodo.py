@@ -170,8 +170,10 @@ def _get_url(ctx: RunContext) -> str:
 
 def _call_kimodo(base_url: str, prompt: str) -> bytes:
     body = json.dumps({"prompt": prompt}).encode()
+    # FastAPI redirect_slashes=True redirects /generate → /generate/;
+    # use the canonical trailing-slash URL to avoid urllib's redirect loop.
     req = urllib.request.Request(
-        f"{base_url}/generate", data=body, method="POST")
+        f"{base_url}/generate/", data=body, method="POST")
     req.add_header("Content-Type", "application/json")
     # Modal cold start + model load + generation can exceed 2 min on first call;
     # local Docker is fast, but using a generous timeout hurts nothing.
