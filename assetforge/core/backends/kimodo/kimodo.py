@@ -170,20 +170,53 @@ def _get_url(ctx: RunContext) -> str:
 
 def _call_kimodo(base_url: str, prompt: str) -> bytes:
     body = json.dumps({"prompt": prompt}).encode()
-    # FastAPI redirect_slashes=True redirects /generate → /generate/;
-    # use the canonical trailing-slash URL to avoid urllib's redirect loop.
-    req = urllib.request.Request(
-        f"{base_url}/generate/", data=body, method="POST")
-    req.add_header("Content-Type", "application/json")
-    # Modal cold start + model load + generation can exceed 2 min on first call;
-    # local Docker is fast, but using a generous timeout hurts nothing.
     is_modal = "modal.run" in base_url
     timeout = 600 if is_modal else 180
+
+    # The Kimodo API returns 303 See Other after processing (POST→redirect→GET
+    # result pattern).  Python's default redirect handler converts the POST to
+    # GET on redirect, which triggers another 303 → infinite loop.  We stop at
+    # the first redirect, read the Location header, then issue the GET ourselves.
+    _captured: list = [None, None]   # [location, response_headers]
+
+    class _StopAndCapture(urllib.request.HTTPRedirectHandler):
+        def http_error_303(self, req, fp, code, msg, headers):
+            _captured[0] = headers.get("Location")
+            _captured[1] = dict(headers)
+            raise urllib.error.HTTPError(req.full_url, code, msg, headers, fp)
+        http_error_301 = http_error_303
+        http_error_302 = http_error_303
+        http_error_307 = http_error_303
+        http_error_308 = http_error_303
+
+    opener = urllib.request.build_opener(_StopAndCapture())
+    req = urllib.request.Request(
+        f"{base_url}/generate", data=body, method="POST")
+    req.add_header("Content-Type", "application/json")
+
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with opener.open(req, timeout=timeout) as resp:
             return resp.read()
     except urllib.error.HTTPError as exc:
-        raise KimodoError(f"Kimodo returned HTTP {exc.code}: {exc.read().decode()}") from exc
+        loc = _captured[0]
+        if exc.code in (301, 302, 303, 307, 308) and loc:
+            result_url = loc if loc.startswith("http") else f"{base_url}{loc}"
+            print(f"[AssetForge] Kimodo: following {exc.code} → {result_url}")
+            get_req = urllib.request.Request(result_url, method="GET")
+            try:
+                with urllib.request.urlopen(get_req, timeout=timeout) as resp:
+                    data = resp.read()
+                    print(f"[AssetForge] Kimodo: result {resp.status} len={len(data)} bytes")
+                    return data
+            except urllib.error.HTTPError as ge:
+                raise KimodoError(
+                    f"Kimodo redirect GET {result_url} → HTTP {ge.code}: "
+                    f"{ge.read().decode()[:200]}"
+                ) from ge
+        raise KimodoError(
+            f"Kimodo returned HTTP {exc.code} (no redirect location): "
+            f"{exc.read().decode()[:200]}"
+        ) from exc
     except Exception as exc:
         raise KimodoError(f"Kimodo request failed: {exc}") from exc
 
