@@ -169,56 +169,86 @@ def _get_url(ctx: RunContext) -> str:
 
 
 def _call_kimodo(base_url: str, prompt: str) -> bytes:
+    """Call the Kimodo API, handling Modal's POST→303→poll-GET→303→... pattern.
+
+    Modal ASGI deployment flow:
+      1. POST /generate → 303 See Other → Location: /generate?__modal_function_call_id=X
+      2. GET that URL → 303 again while computing (follow to new/same URL)
+      3. Eventually GET returns 200 with the NPZ binary
+    We block in the poll loop until data arrives or the deadline is reached.
+    """
+    import time as _t
+
     body = json.dumps({"prompt": prompt}).encode()
     is_modal = "modal.run" in base_url
-    timeout = 600 if is_modal else 180
+    deadline = _t.time() + (900 if is_modal else 180)
 
-    # The Kimodo API returns 303 See Other after processing (POST→redirect→GET
-    # result pattern).  Python's default redirect handler converts the POST to
-    # GET on redirect, which triggers another 303 → infinite loop.  We stop at
-    # the first redirect, read the Location header, then issue the GET ourselves.
-    _captured: list = [None, None]   # [location, response_headers]
-
-    class _StopAndCapture(urllib.request.HTTPRedirectHandler):
-        def http_error_303(self, req, fp, code, msg, headers):
-            _captured[0] = headers.get("Location")
-            _captured[1] = dict(headers)
+    # Opener that stops at any redirect so we can handle it ourselves
+    class _StopRedirect(urllib.request.HTTPRedirectHandler):
+        def _stop(self, req, fp, code, msg, headers):
             raise urllib.error.HTTPError(req.full_url, code, msg, headers, fp)
-        http_error_301 = http_error_303
-        http_error_302 = http_error_303
-        http_error_307 = http_error_303
-        http_error_308 = http_error_303
+        http_error_301 = http_error_302 = http_error_303 = _stop
+        http_error_307 = http_error_308 = _stop
 
-    opener = urllib.request.build_opener(_StopAndCapture())
-    req = urllib.request.Request(
-        f"{base_url}/generate", data=body, method="POST")
-    req.add_header("Content-Type", "application/json")
+    opener = urllib.request.build_opener(_StopRedirect())
 
+    # ── Step 1: POST /generate ──────────────────────────────────────────────
+    post_req = urllib.request.Request(f"{base_url}/generate", data=body, method="POST")
+    post_req.add_header("Content-Type", "application/json")
+    # Generous timeout for the POST — Modal may need minutes to spin up a container
+    post_timeout = 600 if is_modal else 60
+
+    poll_url = None
     try:
-        with opener.open(req, timeout=timeout) as resp:
-            return resp.read()
+        with opener.open(post_req, timeout=post_timeout) as resp:
+            return resp.read()   # local Docker returns NPZ directly
     except urllib.error.HTTPError as exc:
-        loc = _captured[0]
+        loc = exc.headers.get("Location")
         if exc.code in (301, 302, 303, 307, 308) and loc:
-            result_url = loc if loc.startswith("http") else f"{base_url}{loc}"
-            print(f"[AssetForge] Kimodo: following {exc.code} → {result_url}")
-            get_req = urllib.request.Request(result_url, method="GET")
-            try:
-                with urllib.request.urlopen(get_req, timeout=timeout) as resp:
-                    data = resp.read()
-                    print(f"[AssetForge] Kimodo: result {resp.status} len={len(data)} bytes")
-                    return data
-            except urllib.error.HTTPError as ge:
-                raise KimodoError(
-                    f"Kimodo redirect GET {result_url} → HTTP {ge.code}: "
-                    f"{ge.read().decode()[:200]}"
-                ) from ge
-        raise KimodoError(
-            f"Kimodo returned HTTP {exc.code} (no redirect location): "
-            f"{exc.read().decode()[:200]}"
-        ) from exc
+            poll_url = loc if loc.startswith("http") else f"{base_url}{loc}"
+            print(f"[AssetForge] Kimodo: POST→{exc.code}, polling {poll_url[:100]}")
+        else:
+            raise KimodoError(
+                f"Kimodo POST /generate HTTP {exc.code} "
+                f"(no redirect): {exc.read().decode()[:200]}"
+            ) from exc
     except Exception as exc:
-        raise KimodoError(f"Kimodo request failed: {exc}") from exc
+        raise KimodoError(f"Kimodo POST failed: {exc}") from exc
+
+    # ── Step 2: poll loop ───────────────────────────────────────────────────
+    # Modal returns 303 from the GET while computation is in progress.
+    # Each 303 gives a new (or same) URL to retry. When computation is done
+    # the GET returns 200 with the NPZ binary.
+    # Short per-request timeout so we retry on socket inactivity.
+    per_req_timeout = 60
+
+    while _t.time() < deadline:
+        try:
+            get_req = urllib.request.Request(poll_url, method="GET")
+            with opener.open(get_req, timeout=per_req_timeout) as resp:
+                data = resp.read()
+                print(f"[AssetForge] Kimodo: result {resp.status} len={len(data)} bytes")
+                return data
+        except urllib.error.HTTPError as exc:
+            loc = exc.headers.get("Location")
+            if exc.code in (301, 302, 303, 307, 308):
+                if loc:
+                    new_url = loc if loc.startswith("http") else f"{base_url}{loc}"
+                    if new_url != poll_url:
+                        print(f"[AssetForge] Kimodo: redirect → {new_url[:100]}")
+                        poll_url = new_url
+                _t.sleep(3)   # brief pause then retry
+            else:
+                raise KimodoError(
+                    f"Kimodo poll HTTP {exc.code}: {exc.read().decode()[:200]}"
+                ) from exc
+        except OSError:
+            _t.sleep(3)   # socket timeout / transient error, retry
+
+    raise KimodoError(
+        f"Kimodo timed out after {900 if is_modal else 180}s — "
+        "check Modal logs at modal.com/apps"
+    )
 
 
 def npz_to_blender_action(npz_path: str, armature_obj, action_name: str = "Kimodo"):
