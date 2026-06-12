@@ -15,6 +15,11 @@ from assetforge.core.backends.generation.drivers import BrowserDriver
 from assetforge.core.backends.generation.hunyuan import FalHttpClient, HunyuanBackend
 from assetforge.core.backends.generation.meshy import MeshyBackend, MeshyHttpClient
 from assetforge.core.backends.generation.tripo import HttpClient, TripoBackend
+from assetforge.core.backends.kimodo.kimodo import KimodoBackend
+from assetforge.core.backends.meshy.animation import MeshyAnimationBackend
+from assetforge.core.backends.meshy.retexture import MeshyRetextureBackend
+from assetforge.core.backends.meshy.rigging import MeshyRiggingBackend
+from assetforge.core.backends.remesh.meshy_remesh import MeshyRemeshBackend
 from assetforge.core.backends.stubs import AnimateStub, ValidateStub
 
 from .geometry.bake import BakeBackend
@@ -35,6 +40,9 @@ def build_blender_registry(
     meshy_http: Optional[MeshyHttpClient] = None,
     fal_http: Optional[FalHttpClient] = None,
     unirig_http: Optional[UniRigHttpClient] = None,
+    meshy_stage_client=None,
+    meshy_remesh_http=None,
+    kimodo_url: Optional[str] = None,
 ) -> BackendRegistry:
     """Full Phase 3-5 registry for use inside Blender."""
     reg = BackendRegistry()
@@ -46,18 +54,23 @@ def build_blender_registry(
     reg.register(HunyuanBackend(http_client=fal_http))      # paid, high quality
 
     # Stages 4-6: geometry algorithms
-    reg.register(RetopoBackend())
+    reg.register(MeshyRemeshBackend(http_client=meshy_remesh_http))  # API, preferred
+    reg.register(RetopoBackend())                                    # bpy fallback
     reg.register(UVBackend())
     reg.register(BakeBackend())
 
-    # Stage 7: texture enhancement pipeline (delight→PBR→upscale→seam check)
+    # Stage 7: texture — Meshy retexture preferred, enhance pipeline fallback
+    reg.register(MeshyRetextureBackend(client=meshy_stage_client))
     reg.register(TextureEnhanceBackend())
 
-    # Stage 8: rigging — UniRig preferred (ML quality), auto_rig fallback
+    # Stage 8: rigging — Meshy + UniRig preferred (ML quality), auto_rig fallback
+    reg.register(MeshyRiggingBackend(client=meshy_stage_client))
     reg.register(UniRigBackend(http_client=unirig_http))
     reg.register(RigifyBackend())
 
-    # Stages 9, 13: still stubs (Phase 6 = animation, Phase 8 = validation polish)
+    # Stages 9, 13: animation — Meshy library + Kimodo generative, stub fallback
+    reg.register(MeshyAnimationBackend(client=meshy_stage_client))
+    reg.register(KimodoBackend(api_url=kimodo_url))
     reg.register(AnimateStub())
     reg.register(ValidateStub())
 

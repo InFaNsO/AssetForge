@@ -1,187 +1,160 @@
-# Development Plan — AI Game-Asset Pipeline for Blender (v0.1)
+# Development Plan — AI Game-Asset Pipeline for Blender (v0.2)
 
 **Companion to:** PROJECT_SPEC.md
-**Scope:** how to actually build it — phasing, the backend-connection strategy, and the in-Blender menu/UX that walks a user through stages 1–13.
+**Updated:** 2026-06 — Meshy as primary AI backend + NVIDIA Kimodo generative animation
 
 ---
 
-## 0. A note on "connect to all the options"
+## 0. Architecture decision: Meshy-first pipeline
 
-Connecting to *every* backend across 13 stages is dozens of integrations and is the surest way to never ship. This plan separates two things:
-
-- **Connect to all *stages*** — yes. Every stage has an adapter slot from day one.
-- **Connect to all *backends*** — no, not early. Wire **2 backends per critical stage** (one local, one API — satisfies the hybrid runtime), and ship a documented "write an adapter" path for the rest. The adapter interface is what makes "all the options" *possible* without making it *mandatory*.
-
-Treat "all the options" as a capability of the architecture, not a Phase-1 deliverable.
-
----
-
-## 1. Phasing overview
-
-| Phase | Goal | Ships when |
-|-------|------|-----------|
-| 0 | Foundation: adapter interface, resolver, asset-state, stubs | Stubbed chain runs end-to-end |
-| 1 | Vertical slice: ONE real backend through ALL stages | One test mesh → exported game-ready asset |
-| 2 | Geometry algorithms hardened (retopo, LOD, collision, bake) | Deterministic stages production-quality |
-| 3 | Generation stage: 2 backends (TRELLIS.2 local + 1 API) | Real input → mesh, backend-switchable |
-| 4 | Texture enhancement: delight → PBR decomp → upscale → seams | Generator textures measurably improved |
-| 5 | Rigging + canonical skeleton + 2 backends + Rigify fallback | Mesh → rigged on canonical skeleton |
-| 6 | Animation: retargeter → Mixamo → 2 generative backends | Rig → animated, multi-source motion |
-| 7 | MCP layer: stages exposed as tools | Claude can drive the full chain |
-| 8 | UX polish: guided menu, batch, export presets, validation | The menu in §4 is complete |
-| 9 | Backend breadth: add adapters per demand | Ongoing |
-
-**Hard rule:** Phases 0 and 1 are non-negotiable and come first. They are the thin thread that proves the architecture. Everything after deepens a thread that already runs end-to-end.
-
----
-
-## 2. The backend-connection strategy
-
-### 2.1 Adapter contract
-
-Every backend is an adapter implementing the §4.2 interface from the spec:
+Meshy provides a complete REST API covering every AI stage of the game-asset pipeline.
+Rather than wiring individual ML models for each stage, we use Meshy as the primary
+AI backend and reserve Kimodo for generative (text-prompted) animation, which Meshy
+does not offer (its animation is library-based, not generative).
 
 ```
-supports_local() / supports_api()
-vram_required()
-run_local(inputs, params) / run_api(inputs, params)
-cost_estimate(inputs)   -> {time, credits, vram}
-capabilities()          -> {stage, input_types, output_types, skeleton?, emits_quads?}
+INPUT (image / text / mesh)
+      │
+      ▼  Stage 3 — Generation
+   Meshy Image/Text-to-3D  ◄── primary (paid)
+   Copilot 3D              ◄── free fallback (manual GLB download)
+      │
+      ▼  Stage 4 — Retopology
+   Meshy Remesh            ◄── primary (quad-dominant, trained on game meshes)
+   Instant Meshes          ◄── local fallback (if exe path set in prefs)
+   Decimate COLLAPSE       ◄── always-available fallback
+      │
+      ▼  Stage 5 — UV Unwrap
+   Blender Smart UV        ◄── algorithmic (always)
+      │
+      ▼  Stage 6 — Baking
+   Blender Cycles bake     ◄── algorithmic (normal/AO, optional)
+      │
+      ▼  Stage 7 — Texture
+   Meshy Retexture         ◄── primary (text/image-guided PBR retexture)
+   AssetForge enhance      ◄── fallback (delight → PBR decomp → upscale)
+      │
+      ▼  Stage 8 — Rigging
+   Meshy Rigging           ◄── primary (humanoid only, outputs Mixamo-compatible rig)
+   AssetForge auto-rig     ◄── fallback (bounding-box Rigify rig)
+      │
+      ▼  Stage 9 — Animation
+   Meshy Animation library ◄── 584+ mocap clips (walk/run/fight/dance/idle...)
+   Kimodo (NVIDIA)         ◄── generative: text prompt → novel motion (self-hosted)
+      │
+      ▼  Stages 10-13 — LOD / Collision / Export / Validate
+   Blender algorithms      ◄── always (Decimate, convex hull, glTF export)
 ```
 
-`capabilities()` is what lets the resolver and UI reason about a backend without hardcoding — e.g. "this generator emits quads, so offer to skip retopo."
-
-### 2.2 Connection types (and the auth reality)
-
-| Backend kind | Examples | Connection | Auth |
-|--------------|----------|-----------|------|
-| Local model | TRELLIS.2, UniRig, local diffusion | subprocess / local server, weights on disk | none |
-| Vendor API | Tripo, Meshy, Rodin, DeepMotion | REST, adapter holds client | API key (user-supplied) |
-| Aggregator API | Replicate, fal.ai | REST, many models via one key | one key, many models |
-| Asset library | Mixamo | download + retarget, not inference | account/manual |
-| MCP-exposed tool | blend-ai, Blender MCP | already in your connector set | per-connector |
-
-**Key management:** API keys live in the addon preferences, never in the asset state or repo. One secrets store, read by adapters at call time. This is also a §10 risk if mishandled — keys in provenance logs would leak.
-
-### 2.3 Resolver logic
-
-Per stage, pick a backend by: explicit user choice → hardware probe (VRAM available?) → availability (key present? model downloaded?) → cost (time/credits). Always allow manual override in the UI. Resolver returns *why* it chose a backend (shown in UI for transparency).
-
-### 2.4 Failure + fallback
-
-- Local OOM → offer API fallback (don't silently switch; ask, since API costs credits).
-- API auth fail → surface re-auth via the connector flow, don't crash the chain.
-- Backend unavailable → stage is skippable or falls to algorithmic default where one exists (e.g. retopo → QuadriFlow).
-
-### 2.5 Minimum backends per stage at each phase
-
-| Stage | Phase 1 (slice) | Target (Phase 3–6) |
-|-------|-----------------|--------------------|
-| Generation | 1 (TRELLIS.2 or 1 API) | TRELLIS.2 + Hunyuan3D + 1 API |
-| Retopo | QuadriFlow (algo) | + learned option |
-| Texture enhance | passthrough stub | delight + PBR + upscale + seam |
-| Rigging | Rigify (algo) | + UniRig + 1 API |
-| Animation | Mixamo (1 clip) | + retarget + Kimodo + Hunyuan Motion + 1 video-mocap |
-| LOD/Collision/Bake/Export | algo (final) | algo (final) |
+**Free path** (no API keys): Copilot 3D → Instant Meshes/Decimate → Blender UV/bake
+→ AssetForge texture enhance → AssetForge auto-rig → no animation → Blender export.
+Full quality path requires a Meshy key. Kimodo requires a local GPU (RTX 4080 works
+with `TEXT_ENCODER_DEVICE=cpu`).
 
 ---
 
-## 3. Engineering practices (so phases don't rot)
+## 1. Phasing (updated)
 
-- **Stub-first.** Every stage works with a stub before a real backend lands. The chain must always run.
-- **Asset-state is the contract.** Stages read/write the serializable asset object only; no stage reaches into another's internals.
+| Phase | Goal | Status |
+|-------|------|--------|
+| 0 | Foundation: adapter/resolver/asset-state/stubs/CI | ✅ Done |
+| 1 | Vertical slice: Copilot 3D + Tripo → full chain (stubs) | ✅ Done |
+| 2 | Geometry algorithms: retopo/UV/bake/LOD/collision/export | ✅ Done |
+| 3 | Generation breadth + Meshy Remesh | ✅ Done |
+| 4 | Meshy Retexture (replaces algorithmic enhance as primary) | ✅ Done |
+| 5 | Meshy Rigging (replaces Rigify as primary) | ✅ Done |
+| 6 | Animation: Meshy library (584+ clips) + Kimodo generative | ✅ Done |
+| 7 | MCP layer: stages as Claude tools | 🔜 Next |
+| 8 | Full guided/expert stage-rail UI | 🔜 |
+| 9 | Backend breadth: more adapters per demand | Ongoing |
+
+---
+
+## 2. Meshy API surface used
+
+| Endpoint | Stage | Input | Output | Credits |
+|---|---|---|---|---|
+| `/openapi/v1/image-to-3d` | 3 | image URL / data URI | GLB + PBR maps | ~5 |
+| `/openapi/v1/text-to-3d` | 3 | text prompt | GLB + PBR maps | ~5 |
+| `/openapi/v1/remesh` | 4 | model URL / task ID | quad GLB | ~2 |
+| `/openapi/v1/retexture` | 7 | model URL + style prompt | retextured GLB + PBR maps | ~10 |
+| `/openapi/v1/rigging` | 8 | textured humanoid GLB | rigged FBX + GLB + walk/run | ~5 |
+| `/openapi/v1/animations` | 9 | rig_task_id + action_id | animated FBX + GLB | ~2 |
+
+All endpoints follow: POST to create (→ task_id), GET `/:id` to poll, result has URLs.
+
+---
+
+## 3. NVIDIA Kimodo (stage 9 — generative animation)
+
+**What it is:** KInematic MOtion DiffusiOn — NVIDIA Research, released March 2026.
+Text prompt → 3D skeletal body animation. 282 M params, trained on 700 h commercial mocap.
+- Repo: https://github.com/nv-tlabs/kimodo (Apache 2.0, commercial use OK)
+- Weights: NVIDIA Open Model License (commercial OK for SOMA skeleton)
+- HuggingFace demo: https://huggingface.co/spaces/nvidia/Kimodo
+
+**Hardware on this machine (RTX 4080 16 GB):**
+Run with `TEXT_ENCODER_DEVICE=cpu` to offload the Llama-3 text encoder (16 GB) to
+RAM (94 GB available). The motion model itself needs only ~3 GB VRAM. Feasible.
+
+**Integration via Docker REST wrapper** (community, Apache 2.0):
+```
+docker run -p 9551:9551 -e HF_TOKEN=<token> \
+    --gpus=all ghcr.io/eyalenav/kimodo-api:latest
+POST http://localhost:9551/generate  {"prompt": "..."}  →  NPZ binary
+```
+
+**Output:** NPZ with SOMA joints (77 joints, SMPL-X-compatible first 24).
+We convert: NPZ → Blender FCurves using joint index → Mixamo bone name mapping.
+
+**Kimodo vs Meshy Animation:**
+
+| Feature | Meshy Animation | Kimodo |
+|---|---|---|
+| Generative (text prompt) | ❌ (library only) | ✅ |
+| Library clips | ✅ 584+ clips | ❌ |
+| Cost | ~2 credits / clip | Free (self-hosted) |
+| Hardware | Cloud | Local GPU needed |
+| Output | FBX / GLB (ready to use) | NPZ (needs conversion) |
+| Integration | REST API | Docker REST |
+
+**Recommended usage:** use Meshy Animation for standard clips (idle, walk, run, fight),
+use Kimodo for custom/specialized motion from text descriptions.
+
+---
+
+## 4. Backend connection strategy (updated §2.5)
+
+| Stage | Primary | Fallback 1 | Fallback 2 |
+|-------|---------|------------|------------|
+| 3 Generation | Meshy image/text-to-3D | Tripo / Hunyuan (fal.ai) | Copilot 3D (free, manual) |
+| 4 Retopology | Meshy Remesh | Instant Meshes | Decimate COLLAPSE |
+| 5 UV | Blender Smart UV | — | — |
+| 6 Bake | Blender Cycles | skip (no Cycles) | — |
+| 7 Texture | Meshy Retexture | AssetForge enhance | passthrough |
+| 8 Rigging | Meshy Rigging | AssetForge auto-rig | Rigify |
+| 9 Animation | Meshy library + Kimodo | Mixamo (manual) | — |
+| 10-13 | Blender algorithms | — | — |
+
+---
+
+## 5. Engineering practices (unchanged from v0.1 §3)
+
+- **Stub-first.** Every stage works with a stub before a real backend lands.
+- **Asset-state is the contract.** Stages read/write only the serializable asset object.
 - **Provenance on every artifact.** Backend + params recorded (minus secrets).
-- **Golden test mesh.** One mesh runs the whole chain in CI from Phase 1 on; regressions caught immediately.
-- **Validation gates between stages.** Cheap deterministic checks; a stage can refuse bad input rather than propagate it.
+- **Golden test mesh.** One mesh runs the whole chain in CI headless.
+- **Validation gates between stages.** Cheap deterministic checks.
 
 ---
 
-## 4. The Blender menu / guided UX (stages 1–13)
+## 6. Remaining open decisions
 
-The UI must do two contradictory things well: **guide a newcomer linearly** through 1–13, and **let an expert jump to any stage**. Design solves this with a persistent stage rail plus a contextual panel.
-
-### 4.1 Layout
-
-```
-┌──────────────────────────────────────────────────────────┐
-│  N-panel tab: "AssetForge"                                  │
-├───────────────┬──────────────────────────────────────────┤
-│  STAGE RAIL    │  ACTIVE STAGE PANEL                        │
-│  (always       │  (changes with selected stage)            │
-│   visible)     │                                           │
-│                │  ┌─────────────────────────────────────┐ │
-│  ✓ 1 Concept   │  │ Stage title + 1-line "what this does" │ │
-│  ✓ 3 Generate  │  │                                       │ │
-│  ▶ 4 Retopo    │  │ Backend: [resolver pick ▼] (why: ...)  │ │
-│    5 UV        │  │ Params: ... (sane defaults)            │ │
-│    6 Bake      │  │                                       │ │
-│    7 Texture   │  │ [Run stage]   [Skip]   [Manual]        │ │
-│    8 Rig       │  │                                       │ │
-│    9 Animate   │  │ Validation: ⚠ unapplied scale          │ │
-│    10 LOD      │  └─────────────────────────────────────┘ │
-│    11 Collision│                                           │
-│    12 Export   │  [< Prev stage]        [Next stage >]      │
-│    13 Validate │                                           │
-└───────────────┴──────────────────────────────────────────┘
-```
-
-### 4.2 Stage rail behavior
-
-- Each stage shows state: **done ✓ / active ▶ / pending / skipped / N-A**.
-- N-A is computed from asset state — e.g. a static prop greys out Rig/Animate; a quad-emitting generator marks Retopo "optional."
-- Click any stage to jump (expert path). The rail never forces linearity, but **Next/Prev** buttons give newcomers a guided track.
-- Hovering a stage shows the one-line "what goes into this step and why" — the pipeline education from our earlier discussion lives here as tooltips.
-
-### 4.3 Active-stage panel — consistent anatomy per stage
-
-Every stage panel has the same skeleton so the UI is learnable:
-
-1. **Title + one-line purpose** (plain language).
-2. **Backend selector** — resolver's pick pre-selected, dropdown to override, with a "why this was chosen" line (transparency from §2.3).
-3. **Params** — collapsed to sane defaults; "Advanced" expander for the rest.
-4. **Actions** — `Run` / `Skip` / `Do manually` (the last just opens the relevant Blender tools and marks the stage manual).
-5. **Validation strip** — live cheap checks relevant to this stage, with one-click fixes where deterministic (Apply scale, Recalculate normals).
-6. **Cost preview** — for API backends: estimated credits/time before running.
-
-### 4.4 The "guide" layer (newcomer mode)
-
-A toggle: **Guided** vs **Expert**.
-
-- **Guided:** enforces Next/Prev flow, blocks advancing past a failed validation gate (with override), shows fuller explanations, defaults everything.
-- **Expert:** rail free-navigation, terse panels, no gating, all params exposed.
-
-This resolves the contradiction in §4 without two separate UIs — same panels, different guard-rails.
-
-### 4.5 Top-level entry points
-
-- **"New asset from image / text / mesh"** — sets input, jumps to the right starting stage.
-- **"Run to end"** — runs all non-skipped stages with current backends (the closest thing to a one-button flow, but explicit about what it'll do and cost).
-- **"Batch"** — folder in, runs the chain per item, report out.
-- **MCP** (Phase 7+) — same operators, driven by Claude; the menu and MCP share the operator layer so they never diverge.
+- MCP server: build on existing connector vs custom (Phase 7) — module spec needed.
+- Kimodo retargeting quality: SOMA→Meshy rig bone mapping needs live testing.
+- Animation length stitching for Kimodo (long actions, loop transitions).
+- Licensing review: all backends reviewed, Kimodo SOMA weights Apache 2.0 ✅.
 
 ---
 
-## 5. Risks specific to this plan
-
-| Risk | Mitigation |
-|------|-----------|
-| "Connect to all backends" scope creep | §0 — adapters are a path, 2-per-stage is the deliverable |
-| UI built before operators stable → rework | Menu is Phase 8; operators exist from Phase 1, UI is a thin shell over them |
-| Guided/Expert modes diverging into two UIs | Same panels, mode only changes guard-rails (§4.4) |
-| Resolver "why" being opaque → users distrust auto-pick | Always show reason + allow override (§2.3, §4.3) |
-| Stages reaching into each other | Asset-state is the only contract (§3) |
-
----
-
-## 6. Recommended immediate next steps
-
-1. Build the **adapter interface + resolver + asset-state with stubs** (Phase 0). No models yet.
-2. Define the **asset-state schema** concretely — it's the contract everything depends on.
-3. Stand up the **golden test mesh + CI chain**.
-4. Only then: wire the **first real backend** and run the Phase-1 slice.
-
-The menu, however appealing to start with, comes after the operators it wraps exist. Building the panel first means rebuilding it.
-
----
-
-*Next deep-dives available: asset-state schema · adapter/resolver detailed spec · texture-enhancement module · the stage-panel param sets.*
+*Phase 7 next deep-dive: MCP server spec — exposing stage operators as Claude tools.*

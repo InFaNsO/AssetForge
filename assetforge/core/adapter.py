@@ -57,6 +57,7 @@ class RunContext:
     work_dir: str = "."
     vram_free_mb: Optional[int] = None   # filled by the hardware probe (resolver.py)
     user_choice: dict = field(default_factory=dict)   # stage_key -> backend name
+    user_data: dict = field(default_factory=dict)      # per-run config (e.g. Kimodo URL)
 
 
 class Backend:
