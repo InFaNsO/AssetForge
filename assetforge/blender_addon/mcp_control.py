@@ -299,14 +299,28 @@ def apply_kimodo_animation(armature_name: Optional[str] = None,
         from assetforge.core.backends.kimodo.kimodo import npz_to_blender_action
         action = npz_to_blender_action(str(npz_path), arm_obj, action_name)
 
+        # Push into NLA track so the action survives subsequent animation imports
+        # and is picked up by the Unity FBX exporter as a separate clip.
+        if arm_obj.animation_data is None:
+            arm_obj.animation_data_create()
+        cur = arm_obj.animation_data.action
+        if cur and cur != action:
+            cur.use_fake_user = True
+        track = arm_obj.animation_data.nla_tracks.new()
+        track.name = action_name
+        strip = track.strips.new(action_name, 1, action)
+        strip.name = action_name
+        arm_obj.animation_data.action = None  # NLA in control
+
         state.metadata.setdefault("animate", {}).update({
             "kimodo_action": action.name,
             "kimodo_frames": int(action.frame_range[1]),
         })
         _save_state(state)
+        frames = int(action.frame_range[1])
         return {"ok": True, "action": action.name,
                 "armature": arm_obj.name,
-                "frames": int(action.frame_range[1])}
+                "frames": frames}
     except Exception as exc:
         return _err(f"{exc}", trace=traceback.format_exc())
 
@@ -335,6 +349,78 @@ def export_unity(embed_textures: bool = False,
         params["armature_name"] = armature_name
 
     return run_stage("export", backend="unity_fbx_export", params=params)
+
+
+def import_animation_glb(glb_path: str, action_name: str,
+                          armature_name: Optional[str] = None) -> dict:
+    """Import a Meshy/GLTF animation GLB and push its action onto the scene armature's NLA.
+
+    Meshy animation GLBs share the same Mixamo bone layout as Meshy-rigged characters,
+    so the action retargets directly without remapping. The imported GLB geometry is
+    discarded; only the action is kept (use_fake_user=True) in an NLA track.
+
+    ``glb_path``: absolute or Blender-relative path to the animation GLB.
+    ``action_name``: what to name the resulting Blender action.
+    ``armature_name``: explicit armature object name; auto-detected if omitted.
+    """
+    try:
+        glb_path_abs = bpy.path.abspath(str(glb_path))
+        if not os.path.exists(glb_path_abs):
+            return _err(f"GLB not found: {glb_path_abs}")
+
+        our_arm = (bpy.data.objects.get(armature_name) if armature_name
+                   else _find_armature_in_scene())
+        if our_arm is None:
+            return _err("no armature in scene — import the rigged character first")
+
+        before_objs = set(o.name for o in bpy.data.objects)
+        before_actions = set(a.name for a in bpy.data.actions)
+
+        bpy.ops.import_scene.gltf(filepath=glb_path_abs)
+
+        new_objs = [o for o in bpy.data.objects if o.name not in before_objs]
+        new_actions = [a for a in bpy.data.actions if a.name not in before_actions]
+
+        if not new_actions:
+            for o in new_objs:
+                bpy.data.objects.remove(o, do_unlink=True)
+            return _err(f"no animation action found in {glb_path}")
+
+        # Take the action with the most frames (the real motion, not a bind pose)
+        anim_action = max(new_actions, key=lambda a: a.frame_range[1])
+        anim_action.name = action_name
+        anim_action.use_fake_user = True
+
+        # Preserve any current active action
+        if our_arm.animation_data is None:
+            our_arm.animation_data_create()
+        cur = our_arm.animation_data.action
+        if cur and cur != anim_action:
+            cur.use_fake_user = True
+
+        # Push into NLA track — each animation becomes a separate clip in Unity
+        our_arm.animation_data.action = anim_action
+        track = our_arm.animation_data.nla_tracks.new()
+        track.name = action_name
+        strip = track.strips.new(action_name, int(anim_action.frame_range[0]), anim_action)
+        strip.name = action_name
+        our_arm.animation_data.action = None  # NLA in control
+
+        # Discard imported duplicate geometry
+        for o in new_objs:
+            bpy.data.objects.remove(o, do_unlink=True)
+        for mesh in [m for m in bpy.data.meshes if m.users == 0]:
+            bpy.data.meshes.remove(mesh)
+        for arm_data in [a for a in bpy.data.armatures
+                         if a.users == 0 and a != our_arm.data]:
+            bpy.data.armatures.remove(arm_data)
+
+        frames = int(anim_action.frame_range[1] - anim_action.frame_range[0])
+        print(f"[AssetForge] Imported '{action_name}' ({frames} fr) onto '{our_arm.name}'")
+        return {"ok": True, "action": action_name, "frames": frames,
+                "armature": our_arm.name}
+    except Exception as exc:
+        return _err(f"{exc}", trace=traceback.format_exc())
 
 
 def _find_armature_in_scene():

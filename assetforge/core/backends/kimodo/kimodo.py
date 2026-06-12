@@ -63,19 +63,21 @@ _DEFAULT_URL = "http://localhost:9551"
 
 # SOMA joint index (0-23) -> Mixamo bone name
 SOMA_TO_MIXAMO: dict[int, str] = {
+    # Bone names verified against Meshy rigged GLB (June 2026).
+    # Meshy uses Spine01/Spine02 instead of Spine1/Spine2, and 'neck' (lowercase).
     0:  "Hips",
     1:  "LeftUpLeg",
     2:  "RightUpLeg",
     3:  "Spine",
     4:  "LeftLeg",
     5:  "RightLeg",
-    6:  "Spine1",
+    6:  "Spine01",
     7:  "LeftFoot",
     8:  "RightFoot",
-    9:  "Spine2",
+    9:  "Spine02",
     10: "LeftToeBase",
     11: "RightToeBase",
-    12: "Neck",
+    12: "neck",
     13: "LeftShoulder",
     14: "RightShoulder",
     15: "Head",
@@ -205,6 +207,7 @@ def npz_to_blender_action(npz_path: str, armature_obj, action_name: str = "Kimod
     fps = 30
 
     action = bpy.data.actions.new(name=action_name)
+    action.use_fake_user = True   # keep action alive when next anim becomes active
     armature_obj.animation_data_create()
     armature_obj.animation_data.action = action
 
