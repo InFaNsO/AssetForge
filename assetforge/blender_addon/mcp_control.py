@@ -169,15 +169,24 @@ def run_stage(stage_key: str, backend: Optional[str] = None,
             "mode": res.mode.value, "reason": res.reason, **_state_summary(state)}
 
 
-def generate(mode: str = "combined", style_prompt: Optional[str] = None,
+def generate(mode: str = "combined", model: str = "meshy-6",
+             style_prompt: Optional[str] = None,
              params: Optional[dict] = None) -> dict:
     """Stage 3 (+ bundled UV/texture).
 
-    Meshy image-to-3D always returns mesh + UVs + PBR in one task, so:
-      * mode="combined" — accept that output; mark ``uv`` and ``texture`` DONE.
-      * mode="separate" — accept geometry+UV from generation, then run Meshy
-        Retexture as its own step (``style_prompt`` controls the restyle).
+    ``model``: "meshy-6" (default, hero/characters) or "meshy-5" (cheaper, background assets).
+    ``mode``:
+      * "combined" — one Meshy call returns mesh + UV + PBR; mark ``uv`` and ``texture`` DONE.
+      * "separate" — Meshy generates geometry+UV only (should_texture=False), then Meshy
+        Retexture runs as its own step (``style_prompt`` controls the restyle).
     """
+    params = dict(params or {})
+    meshy = dict(params.get("meshy", {}))
+    meshy.setdefault("ai_model", model)
+    meshy["should_texture"] = (mode == "combined")
+    meshy["enable_pbr"] = (mode == "combined")
+    params["meshy"] = meshy
+
     gen = run_stage("generate", params=params)
     if not gen.get("ok"):
         return gen

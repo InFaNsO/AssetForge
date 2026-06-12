@@ -22,9 +22,9 @@ from ...adapter import Backend, Capabilities, CostEstimate, RunContext, RunMode
 from ...asset_state import AssetState
 from ...secrets import get_api_key
 
-BASE_URL = "https://api.meshy.ai/v2"
+BASE_URL = "https://api.meshy.ai/openapi/v1"
 _DONE = "SUCCEEDED"
-_FAILED = {"FAILED", "EXPIRED"}
+_FAILED = {"FAILED", "EXPIRED", "CANCELED"}
 
 
 class MeshyHttpClient(Protocol):
@@ -57,9 +57,21 @@ class UrllibMeshyClient:
     def create_task(self, base_url: str, api_key: str, image_path: str, params: dict) -> dict:
         with open(image_path, "rb") as fh:
             b64 = base64.b64encode(fh.read()).decode()
-        ext = os.path.splitext(image_path)[1].lstrip(".") or "png"
-        body = {"image_url": f"data:image/{ext};base64,{b64}", "enable_pbr": True}
-        body.update(params.get("meshy", {}))
+        ext = os.path.splitext(image_path)[1].lstrip(".").lower() or "png"
+        if ext == "jpg":
+            ext = "jpeg"
+        meshy = dict(params.get("meshy", {}))            # caller overrides (copy; originals intact)
+        should_texture = bool(meshy.pop("should_texture", True))
+        body = {
+            "image_url": f"data:image/{ext};base64,{b64}",
+            "ai_model": meshy.pop("ai_model", "meshy-6"),         # Meshy 6 default; "meshy-5" for bg assets
+            "should_texture": should_texture,                     # False -> geometry-only ("separate" mode)
+            "enable_pbr": bool(meshy.pop("enable_pbr", True)) and should_texture,
+            "pose_mode": meshy.pop("pose_mode", "a-pose"),        # riggable default for humanoids
+            "topology": meshy.pop("topology", "triangle"),
+            "target_polycount": int(meshy.pop("target_polycount", 30000)),
+        }
+        body.update(meshy)   # remaining overrides: hd_texture, texture_prompt, model_type, ...
         return self._post(f"{base_url}/image-to-3d", api_key, body)
 
     def get_task(self, base_url: str, api_key: str, task_id: str) -> dict:
@@ -106,9 +118,12 @@ class MeshyBackend(Backend):
         dest = os.path.join(ctx.work_dir, f"{state.id}_meshy.glb")
         self.http.download(glb_url, dest)
 
+        meshy_params = params.get("meshy", {})
         state.artifacts["mesh"] = dest
         state.metadata.setdefault("generation", {}).update(
-            {"backend": self.name, "task_id": task_id})
+            {"backend": self.name, "task_id": task_id,
+             "ai_model": meshy_params.get("ai_model", "meshy-6"),
+             "textured": meshy_params.get("should_texture", True)})
         return state
 
     def _poll(self, api_key: str, task_id: str) -> str:
