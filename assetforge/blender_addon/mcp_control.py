@@ -19,7 +19,9 @@ State is stored on the scene (same key the panel uses) so the panel and MCP stay
 from __future__ import annotations
 
 import os
+import threading
 import traceback
+import uuid as _uuid
 from typing import Optional
 
 import bpy
@@ -28,6 +30,7 @@ from assetforge.core.adapter import RunContext, RunMode
 from assetforge.core.asset_state import AssetState, SourceKind, StageStatus
 from assetforge.core.provenance import ProvenanceEntry
 from assetforge.core.resolver import resolve
+from assetforge.core.secrets import DictSecretStore, get_api_key
 from assetforge.core.stages import AssetType
 
 from .backends.registry import build_blender_registry
@@ -302,3 +305,96 @@ def reset() -> dict:
     if _STATE_PROP in _scene():
         del _scene()[_STATE_PROP]
     return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# Async layer — long Meshy/Kimodo calls run in a background thread so they don't
+# freeze Blender's main thread (a multi-minute synchronous poll would). The thread
+# only touches assetforge.core (urllib + files — bpy-free, thread-safe); the key is
+# read on the main thread and passed in via a DictSecretStore. Mirrors how blender-mcp
+# drives its own long generation jobs (create, then poll).
+# ---------------------------------------------------------------------------
+
+_JOBS: dict = {}
+
+
+def _kimodo_url() -> Optional[str]:
+    return os.environ.get("ASSETFORGE_KIMODO_URL")
+
+
+def _core_backend(stage_key: str, name: Optional[str] = None):
+    """Return (backend_instance, run_mode) for a stage — core-only, no bpy/registry."""
+    from assetforge.core.backends.generation.meshy import MeshyBackend
+    from assetforge.core.backends.kimodo.kimodo import KimodoBackend
+    from assetforge.core.backends.meshy.animation import MeshyAnimationBackend
+    from assetforge.core.backends.meshy.retexture import MeshyRetextureBackend
+    from assetforge.core.backends.meshy.rigging import MeshyRiggingBackend
+    from assetforge.core.backends.remesh.meshy_remesh import MeshyRemeshBackend
+
+    if stage_key == "animate" and name == "kimodo":
+        return KimodoBackend(api_url=_kimodo_url()), RunMode.LOCAL
+    table = {
+        "generate": MeshyBackend,
+        "texture":  MeshyRetextureBackend,
+        "rig":      MeshyRiggingBackend,
+        "retopo":   MeshyRemeshBackend,
+        "animate":  MeshyAnimationBackend,
+    }
+    cls = table.get(stage_key)
+    return (cls(), RunMode.API) if cls else (None, None)
+
+
+def _bg(jid, backend, mode, state, params, ctx):
+    try:
+        result = backend.run(mode, state, params, ctx)
+        _JOBS[jid].update({"status": "done", "state": result.to_json()})
+    except Exception as exc:
+        _JOBS[jid].update({"status": "error", "error": str(exc),
+                           "trace": traceback.format_exc()[-1400:]})
+
+
+def start(stage_key: str, backend: Optional[str] = None,
+          params: Optional[dict] = None) -> dict:
+    """Kick off a long API/Kimodo stage in a background thread. Returns {job: id};
+    poll it with poll(job). Use this (not run_stage) for generate/texture/rig/animate/
+    retopo so Blender's main thread never blocks on the multi-minute call."""
+    state = _load_state()
+    if state is None:
+        return _err("no state — call setup() first")
+    be, mode = _core_backend(stage_key, backend)
+    if be is None:
+        return _err(f"no core backend for stage {stage_key!r}")
+    key = get_api_key(get_secret_store(bpy.context), "meshy")
+    if mode == RunMode.API and not key:
+        return _err("no Meshy API key in AssetForge prefs")
+    ctx = RunContext(secrets=DictSecretStore({"meshy": key or ""}),
+                     work_dir=bpy.app.tempdir,
+                     user_data=({"kimodo_url": _kimodo_url()} if _kimodo_url() else {}))
+    jid = _uuid.uuid4().hex[:8]
+    _JOBS[jid] = {"status": "running", "stage": stage_key, "backend": be.name}
+    threading.Thread(target=_bg, args=(jid, be, mode, state, params or {}, ctx),
+                     daemon=True).start()
+    return {"ok": True, "job": jid, "stage": stage_key, "backend": be.name, "status": "running"}
+
+
+def poll(jid: str, also_done: Optional[list] = None) -> dict:
+    """Poll a background job. On completion, persist the resulting state to the scene
+    and mark the stage (plus any ``also_done`` stages, e.g. uv/texture bundled with a
+    combined generation) DONE."""
+    job = _JOBS.get(jid)
+    if not job:
+        return _err(f"unknown job {jid!r}")
+    if job["status"] == "running":
+        return {"ok": True, "job": jid, "status": "running"}
+    if job["status"] == "error":
+        return _err(job.get("error", "job failed"), job=jid, trace=job.get("trace"))
+
+    state = AssetState.from_json(job["state"])
+    stage_key = job.get("stage")
+    for sk in [stage_key] + list(also_done or []):
+        if sk:
+            state.set_status(sk, StageStatus.DONE)
+            state.record(ProvenanceEntry.create(sk, job.get("backend", ""), "api", {}))
+    _save_state(state)
+    return {"ok": True, "job": jid, "status": "done", "backend": job.get("backend"),
+            **_state_summary(state)}
