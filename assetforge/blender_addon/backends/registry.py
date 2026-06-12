@@ -25,6 +25,7 @@ from assetforge.core.backends.stubs import AnimateStub, ValidateStub
 from .geometry.bake import BakeBackend
 from .geometry.collision import CollisionBackend
 from .geometry.export_ import ExportBackend
+from .geometry.export_unity import UnityFBXExportBackend
 from .geometry.lod import LODBackend
 from .geometry.retopo import RetopoBackend
 from .geometry.uv import UVBackend
@@ -78,5 +79,6 @@ def build_blender_registry(
     reg.register(LODBackend())
     reg.register(CollisionBackend())
     reg.register(ExportBackend())
+    reg.register(UnityFBXExportBackend())
 
     return reg

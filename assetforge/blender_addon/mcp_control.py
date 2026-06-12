@@ -269,6 +269,80 @@ def animate(action_ids: Optional[list] = None, motion_prompt: Optional[str] = No
     return run_stage("animate", backend="meshy_animation", params=params)
 
 
+def apply_kimodo_animation(armature_name: Optional[str] = None,
+                           action_name: str = "KimodoMotion") -> dict:
+    """Convert the stored Kimodo NPZ into Blender FCurves on the scene armature.
+
+    Must be called on the main thread AFTER poll() returns "done" for a Kimodo
+    animate job. The NPZ path is read from state.artifacts["animations"]["kimodo"].
+
+    ``armature_name``: optional explicit armature object name in the scene.
+    If omitted, the armature with the most children is used (the char rig).
+    """
+    try:
+        state = _load_state()
+        if state is None:
+            return _err("no state — call setup() first")
+
+        npz_path = (state.artifacts.get("animations") or {}).get("kimodo")
+        if not npz_path or not os.path.exists(str(npz_path)):
+            return _err(
+                "no Kimodo NPZ in state; run start('animate', "
+                "params={'motion_prompt': '...'}) then poll(), then call this"
+            )
+
+        arm_obj = (bpy.data.objects.get(armature_name) if armature_name
+                   else _find_armature_in_scene())
+        if arm_obj is None:
+            return _err("no armature found in scene — import the rigged GLB first")
+
+        from assetforge.core.backends.kimodo.kimodo import npz_to_blender_action
+        action = npz_to_blender_action(str(npz_path), arm_obj, action_name)
+
+        state.metadata.setdefault("animate", {}).update({
+            "kimodo_action": action.name,
+            "kimodo_frames": int(action.frame_range[1]),
+        })
+        _save_state(state)
+        return {"ok": True, "action": action.name,
+                "armature": arm_obj.name,
+                "frames": int(action.frame_range[1])}
+    except Exception as exc:
+        return _err(f"{exc}", trace=traceback.format_exc())
+
+
+def export_unity(embed_textures: bool = False,
+                 armature_name: Optional[str] = None) -> dict:
+    """Export the current asset as a Unity-ready FBX.
+
+    Handles:
+      - Meshy 0.01 armature scale: applied in-place before export so Unity
+        reads bone positions in metres, not centimetres.
+      - Unity coordinate system: Y-up, -Z forward.
+      - All Blender actions baked into FBX animation clips.
+      - Armature + all skinned meshes exported together.
+      - ``embed_textures=True``: PBR maps embedded inside the FBX (larger file,
+        self-contained). Default False: textures copied alongside FBX.
+
+    Output path is stored in state.artifacts["exported_unity"].
+    """
+    state = _load_state()
+    if state is None:
+        return _err("no state — call setup() first")
+
+    params: dict = {"embed_textures": embed_textures}
+    if armature_name:
+        params["armature_name"] = armature_name
+
+    return run_stage("export", backend="unity_fbx_export", params=params)
+
+
+def _find_armature_in_scene():
+    """Return the armature with the most children (the character rig), or None."""
+    candidates = [o for o in bpy.data.objects if o.type == "ARMATURE"]
+    return max(candidates, key=lambda o: len(o.children), default=None)
+
+
 def import_mesh() -> dict:
     """Import the current mesh GLB into the Blender scene."""
     state = _load_state()
