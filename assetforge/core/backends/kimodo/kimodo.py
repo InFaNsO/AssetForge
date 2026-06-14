@@ -154,7 +154,9 @@ class KimodoBackend(Backend):
         with open(npz_path, "wb") as fh:
             fh.write(npz_data)
 
-        state.artifacts.setdefault("animations", {})["kimodo"] = npz_path
+        if not isinstance(state.artifacts.get("animations"), dict):
+            state.artifacts["animations"] = {}
+        state.artifacts["animations"]["kimodo"] = npz_path
         state.metadata.setdefault("animate", {}).update({
             "kimodo_prompt": prompt,
             "kimodo_npz": npz_path,
