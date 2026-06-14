@@ -257,35 +257,27 @@ def _call_kimodo(base_url: str, prompt: str, num_frames: int = 196) -> bytes:
 
 def npz_to_blender_action(npz_path: str, armature_obj, action_name: str = "Kimodo",
                           world_align=None, apply_root: bool = False):
-    """Convert a Kimodo NPZ to a Blender action, RETARGETED onto *armature_obj*.
+    """Convert a Kimodo NPZ to a Blender action, retargeted onto *armature_obj*.
 
-    Kimodo outputs motion for a standard SMPL-X human skeleton whose per-bone
-    rest orientations differ from an arbitrary Meshy/Mixamo rig.  Copying the
-    SOMA local rotations straight onto the rig's pose bones (the naive approach)
-    applies every rotation around the wrong axis and grossly distorts the pose.
+    Re-expresses each SOMA local rotation in the target bone's own rest frame:
 
-    Instead we re-express each SOMA local rotation in the *target* bone's own
-    rest frame:
+        basis[b] = A_b⁻¹ · (W · R_local[b] · W⁻¹) · A_b
 
-        basis[b] = A_b⁻¹ · (W · R_soma_local[b] · W⁻¹) · A_b
+    where A_b = bone rest orientation in armature space (bone.matrix_local.to_3x3()),
+    R_local[b] = SOMA parent-relative local rotation for the mapped joint,
+    W = SOMA Y-up → Blender Z-up world alignment (−90° rotation about X).
 
-    where
-        A_b             = target bone's rest GLOBAL orientation (0.01 scale stripped),
-        R_soma_local[b] = Kimodo's local rotation for the mapped joint,
-        W               = SMPL-X (Y-up) → Blender (Z-up) world alignment.
+    The conjugation by A_b ensures that the SOMA T-pose (all R_local = identity)
+    maps to the Meshy rig's rest pose (basis = identity → pb.matrix = A_b). Any
+    remaining mismatch between SOMA and Meshy rest orientations is absorbed per-bone
+    rather than compounding through the FK chain.
 
-    Because all 22 SMPL-X body joints map to a bone, conjugating the local
-    rotation by A_b is equivalent to the full global-delta retarget but needs no
-    explicit parent bookkeeping.
+    SOMA77 joint-index mapping: verified 2026-06-14 from SOMASkeleton77.bone_order_names.
+    Spine chain 0–10, left arm+fingers 11–38, right arm+fingers 39–66, legs 67–76.
 
     Args:
-        world_align: optional mathutils.Matrix (3x3) overriding the default
-            SMPL-X→Blender alignment.  Default is a −90° rotation about X
-            (empirically validated against the Meshy rig; a pure X-rotation, so
-            left/right handedness is preserved).
-        apply_root: if True, bake Kimodo's root translation onto the Hips bone.
-            OFF by default — baked-in root motion causes drift / foot-slide on
-            in-place combat clips; enable only for true locomotion clips.
+        world_align: optional mathutils.Matrix (3×3) overriding the default alignment.
+        apply_root: if True, bake root translation onto the Hips bone (off by default).
 
     Requires numpy and bpy (must run inside Blender).
     """
@@ -303,20 +295,19 @@ def npz_to_blender_action(npz_path: str, armature_obj, action_name: str = "Kimod
 
     data = np.load(npz_path, allow_pickle=True)
     local_rots = data["local_rot_mats"]
-    if local_rots.ndim == 5:          # Kimodo batch dim: (1, T, J, 3, 3) — strip it
+    if local_rots.ndim == 5:          # strip batch dim: (1, T, J, 3, 3) → (T, J, 3, 3)
         local_rots = local_rots[0]
     T, J = local_rots.shape[:2]
 
-    # Target bone rest GLOBAL orientations (pure rotation, 0.01 scale stripped).
     rest = armature_obj.data.bones
     A = {}
     for joint_idx, bone_name in SOMA_TO_MIXAMO.items():
         b = rest.get(bone_name)
         if b is not None:
-            A[bone_name] = b.matrix_local.to_quaternion().to_matrix()
+            A[bone_name] = b.matrix_local.to_3x3()   # rest orientation in armature space
 
     action = bpy.data.actions.new(name=action_name)
-    action.use_fake_user = True   # keep action alive when next anim becomes active
+    action.use_fake_user = True
     armature_obj.animation_data_create()
     armature_obj.animation_data.action = action
 
@@ -328,23 +319,24 @@ def npz_to_blender_action(npz_path: str, armature_obj, action_name: str = "Kimod
         if pb is None:
             continue
         pb.rotation_mode = "QUATERNION"
-        Ainv, Ab = A[bone_name].inverted(), A[bone_name]
+        Ab   = A[bone_name]
+        Ainv = Ab.inverted()
         for t in range(T):
-            R = Matrix(local_rots[t, joint_idx].tolist())
+            R     = Matrix(local_rots[t, joint_idx].tolist())
             basis = Ainv @ (W @ R @ Winv) @ Ab
             pb.rotation_quaternion = basis.to_quaternion()
             pb.keyframe_insert("rotation_quaternion", frame=t + 1)
 
-    # Root translation is OFF by default (see apply_root docstring).
     if apply_root:
         root_pos = data.get("root_positions", None)
-        if root_pos is not None and root_pos.ndim == 3:
-            root_pos = root_pos[0]
-        hips = pose.bones.get("Hips")
-        if root_pos is not None and hips is not None:
-            for t in range(T):
-                hips.location = W @ Vector(root_pos[t].tolist())
-                hips.keyframe_insert("location", frame=t + 1)
+        if root_pos is not None:
+            if root_pos.ndim == 3:
+                root_pos = root_pos[0]
+            hips = pose.bones.get("Hips")
+            if root_pos is not None and hips is not None:
+                for t in range(T):
+                    hips.location = W @ Vector(root_pos[t].tolist())
+                    hips.keyframe_insert("location", frame=t + 1)
 
     action.frame_range = (1, T)
     bpy.context.scene.frame_end = max(bpy.context.scene.frame_end, T)
