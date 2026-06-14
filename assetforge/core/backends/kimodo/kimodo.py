@@ -63,30 +63,32 @@ _DEFAULT_URL = "http://localhost:9551"
 
 # SOMA joint index (0-23) -> Mixamo bone name
 SOMA_TO_MIXAMO: dict[int, str] = {
-    # Bone names verified against Meshy rigged GLB (June 2026).
-    # Meshy uses Spine01/Spine02 instead of Spine1/Spine2, and 'neck' (lowercase).
+    # Indices from SOMASkeleton77.bone_order_names (verified 2026-06-14).
+    # SOMA77 ordering: spine chain first, then arms+hands, then legs at end.
+    # Completely different from SMPL-X (0-21 body joints) — do not confuse.
+    # Meshy/Mixamo bone names: Spine01/Spine02 (not Spine1/2), 'neck' lowercase.
     0:  "Hips",
-    1:  "LeftUpLeg",
-    2:  "RightUpLeg",
-    3:  "Spine",
-    4:  "LeftLeg",
-    5:  "RightLeg",
-    6:  "Spine01",
-    7:  "LeftFoot",
-    8:  "RightFoot",
-    9:  "Spine02",
-    10: "LeftToeBase",
-    11: "RightToeBase",
-    12: "neck",
-    13: "LeftShoulder",
-    14: "RightShoulder",
-    15: "Head",
-    16: "LeftArm",
-    17: "RightArm",
-    18: "LeftForeArm",
-    19: "RightForeArm",
-    20: "LeftHand",
-    21: "RightHand",
+    1:  "Spine",         # Spine1 → Spine
+    2:  "Spine01",       # Spine2 → Spine01
+    3:  "Spine02",       # Chest  → Spine02
+    4:  "neck",          # Neck1  → neck  (Mixamo has one neck bone)
+    6:  "Head",          # Head
+    11: "LeftShoulder",
+    12: "LeftArm",
+    13: "LeftForeArm",
+    14: "LeftHand",
+    39: "RightShoulder",
+    40: "RightArm",
+    41: "RightForeArm",
+    42: "RightHand",
+    67: "LeftUpLeg",     # LeftLeg  → LeftUpLeg  (thigh)
+    68: "LeftLeg",       # LeftShin → LeftLeg    (shin)
+    69: "LeftFoot",
+    70: "LeftToeBase",
+    72: "RightUpLeg",    # RightLeg  → RightUpLeg
+    73: "RightLeg",      # RightShin → RightLeg
+    74: "RightFoot",
+    75: "RightToeBase",
 }
 
 
