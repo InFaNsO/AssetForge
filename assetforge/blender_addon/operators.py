@@ -110,7 +110,10 @@ def _import_if_needed(state: AssetState) -> None:
     if not (os.path.exists(path) and path.lower().endswith((".glb", ".gltf"))):
         return
     try:
+        before = set(o.name for o in bpy.data.objects)
         bpy.ops.import_scene.gltf(filepath=path)
+        from .backends.geometry.utils import fix_armature_bone_display
+        fix_armature_bone_display([o for o in bpy.data.objects if o.name not in before])
     except Exception as exc:
         print(f"[AssetForge] could not import {path}: {exc}")
 

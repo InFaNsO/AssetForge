@@ -445,7 +445,13 @@ def import_mesh() -> dict:
         bpy.ops.import_scene.gltf(filepath=path)
     except Exception as exc:
         return _err(f"import failed: {exc}", trace=traceback.format_exc())
-    new = [o.name for o in bpy.data.objects if o.name not in before]
+    new_objs = [o for o in bpy.data.objects if o.name not in before]
+    try:
+        from .backends.geometry.utils import fix_armature_bone_display
+        fix_armature_bone_display(new_objs)   # repair glTF spiky-bone tails
+    except Exception as exc:
+        print(f"[AssetForge] bone-display fix skipped: {exc}")
+    new = [o.name for o in new_objs]
     state.artifacts["blender_object"] = new[0] if new else None
     _save_state(state)
     return {"ok": True, "imported": new, "path": path}
@@ -558,3 +564,101 @@ def poll(jid: str, also_done: Optional[list] = None) -> dict:
     _save_state(state)
     return {"ok": True, "job": jid, "status": "done", "backend": job.get("backend"),
             **_state_summary(state)}
+
+
+# ---------------------------------------------------------------------------
+# Bulk animation generation (Kimodo) — generate many clips on ONE warm container.
+# Modal's max_containers=1 serializes them anyway; doing them as one batch keeps
+# the container warm so each clip pays only its inference, not a fresh 10-min
+# keep-warm (≈ $0.05/clip batched vs ≈ $0.22 standalone).
+# ---------------------------------------------------------------------------
+
+def start_batch(clips: Optional[list] = None) -> dict:
+    """Kick off BULK Kimodo generation in a background thread (Blender stays
+    responsive). ``clips`` = list of dicts: {name, motion_prompt, num_frames?,
+    playback?}. Each NPZ is generated sequentially and saved to its own path.
+    Poll with poll_batch(job); when done, apply_batch(job) retargets them all
+    onto the rig. Returns {job}."""
+    state = _load_state()
+    if state is None:
+        return _err("no state — call setup() first")
+    url = _kimodo_url()
+    if not url:
+        return _err("no Kimodo URL — set ASSETFORGE_KIMODO_URL")
+    if not clips:
+        return _err("clips list is empty")
+    jid = _uuid.uuid4().hex[:8]
+    _JOBS[jid] = {"status": "running", "kind": "anim_batch",
+                  "total": len(clips), "done": 0, "results": []}
+    threading.Thread(target=_bg_batch,
+                     args=(jid, list(clips), url, bpy.app.tempdir, state.id),
+                     daemon=True).start()
+    return {"ok": True, "job": jid, "total": len(clips), "status": "running"}
+
+
+def _bg_batch(jid, clips, url, work_dir, sid):
+    """Background worker: generate each clip's NPZ sequentially (bpy-free)."""
+    import time as _t
+    from assetforge.core.backends.kimodo.kimodo import _call_kimodo
+    results = []
+    for clip in clips:
+        name = clip.get("name", "clip")
+        t0 = _t.monotonic()
+        rec = {"name": name, "num_frames": int(clip.get("num_frames", 196)),
+               "playback": clip.get("playback", "once")}
+        try:
+            npz = _call_kimodo(url, clip["motion_prompt"], int(clip.get("num_frames", 196)))
+            path = os.path.join(work_dir, f"{sid}_kimodo_{name}.npz")
+            with open(path, "wb") as fh:
+                fh.write(npz)
+            rec.update({"ok": True, "npz": path, "secs": round(_t.monotonic() - t0, 1)})
+        except Exception as exc:
+            rec.update({"ok": False, "error": str(exc)[:300],
+                        "secs": round(_t.monotonic() - t0, 1)})
+        results.append(rec)
+        _JOBS[jid]["done"] = len(results)
+        _JOBS[jid]["results"] = results
+    _JOBS[jid]["status"] = "done"
+    _JOBS[jid]["total_secs"] = round(sum(r.get("secs", 0) for r in results), 1)
+
+
+def poll_batch(jid: str) -> dict:
+    """Poll a bulk animation job — progress (done/total) + per-clip status/timing."""
+    job = _JOBS.get(jid)
+    if not job:
+        return _err(f"unknown job {jid!r}")
+    return {"ok": True, "job": jid, "status": job.get("status"),
+            "done": job.get("done", 0), "total": job.get("total", 0),
+            "total_secs": job.get("total_secs"),
+            "results": job.get("results", [])}
+
+
+def apply_batch(jid: str, armature_name: Optional[str] = None) -> dict:
+    """Retarget EVERY generated NPZ in the batch onto the scene armature as a
+    named, fake-user action (the fixed Rx-90 retarget). Stores ``af_playback``
+    (loop/once/hold) on each action. Run AFTER poll_batch reports 'done'.
+    Main thread only (touches bpy)."""
+    job = _JOBS.get(jid)
+    if not job:
+        return _err(f"unknown job {jid!r}")
+    if job.get("status") != "done":
+        return _err(f"job {jid} not finished ({job.get('status')})")
+    arm = (bpy.data.objects.get(armature_name) if armature_name
+           else _find_armature_in_scene())
+    if arm is None:
+        return _err("no armature in scene")
+    from assetforge.core.backends.kimodo.kimodo import npz_to_blender_action
+    applied = []
+    for r in job.get("results", []):
+        if not r.get("ok"):
+            applied.append({"name": r["name"], "ok": False, "error": r.get("error")})
+            continue
+        try:
+            action = npz_to_blender_action(r["npz"], arm, action_name=r["name"])
+            action.use_fake_user = True
+            action["af_playback"] = r.get("playback", "once")   # loop / once / hold metadata
+            applied.append({"name": r["name"], "ok": True,
+                            "frames": int(action.frame_range[1])})
+        except Exception as exc:
+            applied.append({"name": r["name"], "ok": False, "error": str(exc)[:300]})
+    return {"ok": True, "job": jid, "applied": applied}

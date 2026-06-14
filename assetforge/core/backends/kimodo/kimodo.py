@@ -147,7 +147,7 @@ class KimodoBackend(Backend):
             raise KimodoError("params['motion_prompt'] is required for Kimodo generation")
 
         url = _get_url(ctx)
-        npz_data = _call_kimodo(url, prompt)
+        npz_data = _call_kimodo(url, prompt, int(params.get("num_frames", 196)))
 
         npz_path = os.path.join(ctx.work_dir, f"{state.id}_kimodo.npz")
         os.makedirs(ctx.work_dir, exist_ok=True)
@@ -168,7 +168,7 @@ def _get_url(ctx: RunContext) -> str:
     return ctx.user_data.get("kimodo_url", _DEFAULT_URL) if hasattr(ctx, "user_data") else _DEFAULT_URL
 
 
-def _call_kimodo(base_url: str, prompt: str) -> bytes:
+def _call_kimodo(base_url: str, prompt: str, num_frames: int = 196) -> bytes:
     """Call the Kimodo API, handling Modal's POST→303→poll-GET→303→... pattern.
 
     Modal ASGI deployment flow:
@@ -179,9 +179,9 @@ def _call_kimodo(base_url: str, prompt: str) -> bytes:
     """
     import time as _t
 
-    body = json.dumps({"prompt": prompt}).encode()
+    body = json.dumps({"prompt": prompt, "num_frames": int(num_frames)}).encode()
     is_modal = "modal.run" in base_url
-    deadline = _t.time() + (900 if is_modal else 180)
+    deadline = _t.time() + (1800 if is_modal else 180)
 
     # Opener that stops at any redirect so we can handle it ourselves
     class _StopRedirect(urllib.request.HTTPRedirectHandler):
@@ -246,64 +246,104 @@ def _call_kimodo(base_url: str, prompt: str) -> bytes:
             _t.sleep(3)   # socket timeout / transient error, retry
 
     raise KimodoError(
-        f"Kimodo timed out after {900 if is_modal else 180}s — "
+        f"Kimodo timed out after {1800 if is_modal else 180}s — "
         "check Modal logs at modal.com/apps"
     )
 
 
-def npz_to_blender_action(npz_path: str, armature_obj, action_name: str = "Kimodo"):
-    """Convert a Kimodo NPZ to a Blender animation action applied to *armature_obj*.
+def npz_to_blender_action(npz_path: str, armature_obj, action_name: str = "Kimodo",
+                          world_align=None, apply_root: bool = False):
+    """Convert a Kimodo NPZ to a Blender action, RETARGETED onto *armature_obj*.
 
-    Requires numpy (available in Blender 4.1) and bpy (must run inside Blender).
-    Uses SOMA_TO_MIXAMO joint mapping for the first 24 body joints.
+    Kimodo outputs motion for a standard SMPL-X human skeleton whose per-bone
+    rest orientations differ from an arbitrary Meshy/Mixamo rig.  Copying the
+    SOMA local rotations straight onto the rig's pose bones (the naive approach)
+    applies every rotation around the wrong axis and grossly distorts the pose.
+
+    Instead we re-express each SOMA local rotation in the *target* bone's own
+    rest frame:
+
+        basis[b] = A_b⁻¹ · (W · R_soma_local[b] · W⁻¹) · A_b
+
+    where
+        A_b             = target bone's rest GLOBAL orientation (0.01 scale stripped),
+        R_soma_local[b] = Kimodo's local rotation for the mapped joint,
+        W               = SMPL-X (Y-up) → Blender (Z-up) world alignment.
+
+    Because all 22 SMPL-X body joints map to a bone, conjugating the local
+    rotation by A_b is equivalent to the full global-delta retarget but needs no
+    explicit parent bookkeeping.
+
+    Args:
+        world_align: optional mathutils.Matrix (3x3) overriding the default
+            SMPL-X→Blender alignment.  Default is a −90° rotation about X
+            (empirically validated against the Meshy rig; a pure X-rotation, so
+            left/right handedness is preserved).
+        apply_root: if True, bake Kimodo's root translation onto the Hips bone.
+            OFF by default — baked-in root motion causes drift / foot-slide on
+            in-place combat clips; enable only for true locomotion clips.
+
+    Requires numpy and bpy (must run inside Blender).
     """
     try:
         import numpy as np
     except ImportError as exc:
         raise KimodoError("numpy is required for NPZ import") from exc
 
+    import math
     import bpy
-    from mathutils import Matrix
+    from mathutils import Matrix, Vector
 
-    data = np.load(npz_path)
-    local_rots = data["local_rot_mats"]   # [T, J, 3, 3]
-    root_pos   = data.get("root_positions", None)   # [T, 3] or None
+    W = world_align or Matrix.Rotation(math.radians(-90), 3, "X")
+    Winv = W.transposed()
+
+    data = np.load(npz_path, allow_pickle=True)
+    local_rots = data["local_rot_mats"]
+    if local_rots.ndim == 5:          # Kimodo batch dim: (1, T, J, 3, 3) — strip it
+        local_rots = local_rots[0]
     T, J = local_rots.shape[:2]
-    fps = 30
+
+    # Target bone rest GLOBAL orientations (pure rotation, 0.01 scale stripped).
+    rest = armature_obj.data.bones
+    A = {}
+    for joint_idx, bone_name in SOMA_TO_MIXAMO.items():
+        b = rest.get(bone_name)
+        if b is not None:
+            A[bone_name] = b.matrix_local.to_quaternion().to_matrix()
 
     action = bpy.data.actions.new(name=action_name)
     action.use_fake_user = True   # keep action alive when next anim becomes active
     armature_obj.animation_data_create()
     armature_obj.animation_data.action = action
 
-    arm = armature_obj.pose
-
+    pose = armature_obj.pose
     for joint_idx, bone_name in SOMA_TO_MIXAMO.items():
-        if joint_idx >= J:
+        if joint_idx >= J or bone_name not in A:
             continue
-        bone = arm.bones.get(bone_name)
-        if bone is None:
+        pb = pose.bones.get(bone_name)
+        if pb is None:
             continue
-        bone.rotation_mode = "QUATERNION"
-
+        pb.rotation_mode = "QUATERNION"
+        Ainv, Ab = A[bone_name].inverted(), A[bone_name]
         for t in range(T):
-            mat = Matrix(local_rots[t, joint_idx].tolist())
-            quat = mat.to_quaternion()
-            bone.rotation_quaternion = quat
-            bone.keyframe_insert("rotation_quaternion", frame=t + 1)
+            R = Matrix(local_rots[t, joint_idx].tolist())
+            basis = Ainv @ (W @ R @ Winv) @ Ab
+            pb.rotation_quaternion = basis.to_quaternion()
+            pb.keyframe_insert("rotation_quaternion", frame=t + 1)
 
-    # Apply root translation if available
-    if root_pos is not None:
-        root_bone = arm.bones.get("Hips")
-        if root_bone:
-            root_bone.rotation_mode = "QUATERNION"
+    # Root translation is OFF by default (see apply_root docstring).
+    if apply_root:
+        root_pos = data.get("root_positions", None)
+        if root_pos is not None and root_pos.ndim == 3:
+            root_pos = root_pos[0]
+        hips = pose.bones.get("Hips")
+        if root_pos is not None and hips is not None:
             for t in range(T):
-                root_bone.location = root_pos[t].tolist()
-                root_bone.keyframe_insert("location", frame=t + 1)
+                hips.location = W @ Vector(root_pos[t].tolist())
+                hips.keyframe_insert("location", frame=t + 1)
 
-    # Set action frame range
     action.frame_range = (1, T)
     bpy.context.scene.frame_end = max(bpy.context.scene.frame_end, T)
-    print(f"[AssetForge] Kimodo NPZ imported: {T} frames, "
-          f"{len(SOMA_TO_MIXAMO)} bones mapped")
+    print(f"[AssetForge] Kimodo NPZ retargeted: {T} frames, {len(A)} bones "
+          f"(apply_root={apply_root})")
     return action

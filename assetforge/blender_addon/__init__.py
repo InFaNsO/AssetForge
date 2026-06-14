@@ -7,9 +7,9 @@ addon installed in Blender IS the ``assetforge`` package, ``import assetforge.co
 """
 from __future__ import annotations
 
-from . import prefs, operators, panel
+from . import prefs, operators, panel, handlers
 
-_MODULES = (prefs, operators, panel)
+_MODULES = (prefs, operators, panel, handlers)
 
 
 def register() -> None:
