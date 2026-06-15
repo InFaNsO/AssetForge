@@ -206,6 +206,37 @@ copy .env.example .env
 
 ---
 
+## Troubleshooting
+
+### Imported rig "explodes" into a spiky star of giant bones
+
+**Symptom:** after importing a Meshy/Mixamo rig, the armature draws as a starburst of
+enormous octahedral bones radiating from the character — sometimes tens of metres long —
+hiding the mesh. Animation still plays correctly; only the bone *display* is wrong.
+
+**Cause:** the glTF/GLB format stores **no bone tail or length** — a bone is just a joint
+node (a head position plus an orientation). On import, Blender's glTF importer has to
+*guess* each bone's tail. For some Meshy rigs that guess produces tails pointing in the
+correct direction but at a wildly wrong distance (observed: up to 4881 local units ≈ 48 m
+at the 0.01 cm-export scale). Because the octahedral display draws each bone head→tail,
+every bone becomes a giant spike. The *direction* is right, which is why the rest
+orientation (`matrix_local`) — and therefore skinning and any baked animation — is
+unaffected; only the length is wrong.
+
+**Fix (automatic):** `fix_armature_bone_display()` in
+`assetforge/blender_addon/backends/geometry/utils.py` clamps each over-long tail back to
+its nearest child joint **along its existing direction**, leaving head, direction and roll
+byte-for-byte identical. It is idempotent (a no-op on healthy rigs) and runs on every
+import path: `import_mesh`, `ensure_object`, the addon import operator, and — as a
+whole-scene safety net — `import_animation_glb`, so a rig that arrived spiky from a manual
+import is healed by the next animation import.
+
+**If you imported a rig outside AssetForge** (raw `bpy.ops.import_scene.gltf`, drag-and-drop)
+and it is spiky now, just import any animation onto it via AssetForge, or call
+`fix_armature_bone_display()` directly — both repair the whole scene in place.
+
+---
+
 ## Contributing
 
 1. Fork the repo and create a branch.

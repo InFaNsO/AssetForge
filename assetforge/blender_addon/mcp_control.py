@@ -415,6 +415,20 @@ def import_animation_glb(glb_path: str, action_name: str,
                          if a.users == 0 and a != our_arm.data]:
             bpy.data.armatures.remove(arm_data)
 
+        # Safety net: heal any spiky-boned armature already in the scene. glTF stores
+        # no bone tails, so a rig imported outside the mesh path (manual drag-in, raw
+        # bpy.ops.import_scene.gltf, etc.) can carry the giant-tail "explosion" that
+        # other import paths repair. Importing animations onto a rig is the most common
+        # operation, so this idempotent whole-scene pass guarantees the rig is healed by
+        # the next animation import. No-op on healthy (and already-fixed) rigs.
+        try:
+            from .backends.geometry.utils import fix_armature_bone_display
+            healed = fix_armature_bone_display()
+            if healed:
+                print(f"[AssetForge] healed {healed} spiky bone tails in scene")
+        except Exception as exc:
+            print(f"[AssetForge] bone-display fix skipped: {exc}")
+
         frames = int(anim_action.frame_range[1] - anim_action.frame_range[0])
         print(f"[AssetForge] Imported '{action_name}' ({frames} fr) onto '{our_arm.name}'")
         return {"ok": True, "action": action_name, "frames": frames,
