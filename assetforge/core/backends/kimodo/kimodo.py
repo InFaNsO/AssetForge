@@ -66,11 +66,16 @@ SOMA_TO_MIXAMO: dict[int, str] = {
     # Indices from SOMASkeleton77.bone_order_names (verified 2026-06-14).
     # SOMA77 ordering: spine chain first, then arms+hands, then legs at end.
     # Completely different from SMPL-X (0-21 body joints) — do not confuse.
-    # Meshy/Mixamo bone names: Spine01/Spine02 (not Spine1/2), 'neck' lowercase.
+    #
+    # Meshy spine naming is REVERSE-numbered vs standard Mixamo:
+    #   Meshy "Spine02" = lowest vertebra (parent = Hips)
+    #   Meshy "Spine01" = middle vertebra
+    #   Meshy "Spine"   = chest/top vertebra (parent of LeftShoulder, connects to neck)
+    # Verified 2026-06-15 from bone.parent checks on both Azureheart and husk rigs.
     0:  "Hips",
-    1:  "Spine",         # Spine1 → Spine
-    2:  "Spine01",       # Spine2 → Spine01
-    3:  "Spine02",       # Chest  → Spine02
+    1:  "Spine02",       # SOMA first vertebra above pelvis → Meshy Spine02 (bottom, parent=Hips)
+    2:  "Spine01",       # SOMA second vertebra → Meshy Spine01 (middle)
+    3:  "Spine",         # SOMA chest → Meshy Spine (top, parent of shoulders + neck)
     4:  "neck",          # Neck1  → neck  (Mixamo has one neck bone)
     6:  "Head",          # Head
     11: "LeftShoulder",
