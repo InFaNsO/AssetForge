@@ -276,6 +276,41 @@ def af_animate_batch_apply(job: str, armature_name: str = "") -> str:
     return _out(_call("apply_batch", jid=job, armature_name=armature_name))
 
 
+@mcp.tool()
+def af_bvh_to_fbx(bvh: str, fbx: str = "", global_scale: float = 0.01,
+                 axis_forward: str = "Z", axis_up: str = "Y") -> str:
+    """Convert ONE .bvh motion file to .fbx (vendored mcsantiago/bvh2fbx recipe, run in
+    the open Blender inside a throwaway scene so the current scene is untouched). `fbx`
+    defaults to the BVH path with a .fbx extension. `global_scale` 0.01 suits SOMA/Kimodo
+    BVH (authored in cm); bvh2fbx's original default was 0.0001. Returns output path + frames.
+    Use this to get Kimodo BVH animations into a Unity-importable format."""
+    return _out(_call("bvh_to_fbx", bvh=bvh, fbx=fbx, global_scale=global_scale,
+                      axis_forward=axis_forward, axis_up=axis_up))
+
+
+@mcp.tool()
+def af_bvh_to_fbx_bulk(src_dir: str = "", out_dir: str = "", paths: Optional[list] = None,
+                      global_scale: float = 0.01, axis_forward: str = "Z",
+                      axis_up: str = "Y") -> str:
+    """BULK convert BVH->FBX. Provide `paths` (a list of .bvh files) OR `src_dir` (every
+    *.bvh in that folder). `out_dir` defaults to each file's own folder. Same in-Blender,
+    isolated-temp-scene conversion as af_bvh_to_fbx. Returns per-file results + converted/total count."""
+    return _out(_call("bvh_to_fbx_bulk", src_dir=src_dir, out_dir=out_dir, paths=paths,
+                      global_scale=global_scale, axis_forward=axis_forward, axis_up=axis_up))
+
+
+@mcp.tool()
+def af_bvh_to_fbx_combined(fbx: str, src_dir: str = "", paths: Optional[list] = None,
+                          global_scale: float = 0.01) -> str:
+    """Combine MANY BVH clips into ONE multi-clip FBX — a single shared skeleton with one
+    named take per clip, which Unity imports as separate AnimationClips on one model.
+    Provide `paths` (a list of .bvh files) OR `src_dir` (every *.bvh in it), plus the output
+    `fbx` path. Runs a fresh headless Blender (vendored bvh2fbx/combine_fbx.py) so the take
+    set is clean and your open Blender scene is untouched. `global_scale` 0.01 for SOMA/cm BVH."""
+    return _out(_call("bvh_to_fbx_combined", fbx=fbx, src_dir=src_dir, paths=paths,
+                      global_scale=global_scale))
+
+
 def main() -> None:
     mcp.run()
 

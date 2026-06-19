@@ -437,6 +437,153 @@ def import_animation_glb(glb_path: str, action_name: str,
         return _err(f"{exc}", trace=traceback.format_exc())
 
 
+# ---------------------------------------------------------------------------
+# BVH -> FBX conversion (vendored from mcsantiago/bvh2fbx, see local/bvh2fbx/).
+# bvh2fbx runs `blender -b --python convert_fbx.py`; we instead run the same
+# import-BVH -> export-FBX recipe INSIDE the already-open Blender (no subprocess
+# spin-up, reuses the warm session). Each conversion happens in a throwaway scene
+# so the user's current scene is never disturbed.
+# ---------------------------------------------------------------------------
+
+def _bvh_to_fbx_one(bvh: str, fbx: str, global_scale: float, axis_forward: str,
+                    axis_up: str, frame_start: int) -> dict:
+    """Convert one BVH to FBX in an isolated temp scene. Returns a structured dict."""
+    bvh = bpy.path.abspath(bvh)
+    if not (os.path.exists(bvh) and bvh.lower().endswith(".bvh")):
+        return {"ok": False, "bvh": bvh, "error": "not a .bvh on disk"}
+    if not fbx:
+        fbx = os.path.splitext(bvh)[0] + ".fbx"
+    os.makedirs(os.path.dirname(fbx) or ".", exist_ok=True)
+
+    win = bpy.context.window
+    orig_scene = win.scene
+    tmp = bpy.data.scenes.new("AF_BVH2FBX")
+    win.scene = tmp
+    new = []
+    try:
+        before = set(bpy.data.objects)
+        # bvh2fbx import recipe (convert_fbx.py). global_scale default raised from the
+        # original 0.0001 to 0.01 because SOMA/Kimodo BVH is authored in centimetres.
+        bpy.ops.import_anim.bvh(
+            filepath=bvh, filter_glob="*.bvh", global_scale=float(global_scale),
+            frame_start=int(frame_start), target='ARMATURE', use_fps_scale=False,
+            use_cyclic=False, rotate_mode='NATIVE',
+            axis_forward=axis_forward, axis_up=axis_up,
+            update_scene_fps=False, update_scene_duration=True)
+        new = [o for o in bpy.data.objects if o not in before]
+        arm = next((o for o in new if o.type == 'ARMATURE'), None)
+        frames = 0
+        if arm and arm.animation_data and arm.animation_data.action:
+            frames = int(arm.animation_data.action.frame_range[1])
+
+        bpy.ops.object.select_all(action='DESELECT')
+        for o in new:
+            o.select_set(True)
+        if new:
+            bpy.context.view_layer.objects.active = new[0]
+        bpy.ops.export_scene.fbx(
+            filepath=fbx, use_selection=True, apply_scale_options='FBX_SCALE_NONE',
+            axis_forward=axis_forward, axis_up=axis_up, add_leaf_bones=False,
+            bake_anim=True, bake_anim_use_all_actions=False, bake_anim_use_nla_strips=False)
+        return {"ok": os.path.exists(fbx), "bvh": bvh, "fbx": fbx, "frames": frames}
+    except Exception as exc:
+        return {"ok": False, "bvh": bvh, "error": str(exc)}
+    finally:
+        try:
+            win.scene = orig_scene
+            for o in list(tmp.objects):
+                bpy.data.objects.remove(o, do_unlink=True)
+            bpy.data.scenes.remove(tmp)
+            for a in [a for a in bpy.data.actions if a.users == 0]:
+                bpy.data.actions.remove(a)
+        except Exception:
+            pass
+
+
+def bvh_to_fbx(bvh: str, fbx: str = "", global_scale: float = 0.01,
+               axis_forward: str = "Z", axis_up: str = "Y",
+               frame_start: int = 1) -> dict:
+    """Convert ONE .bvh to .fbx in the open Blender (isolated temp scene; the current
+    scene is untouched). ``fbx`` defaults to the BVH path with a .fbx extension.
+    ``global_scale`` 0.01 suits SOMA/Kimodo BVH (cm); bvh2fbx's original default was 0.0001."""
+    try:
+        return _bvh_to_fbx_one(bvh, fbx, global_scale, axis_forward, axis_up, frame_start)
+    except Exception as exc:
+        return _err(f"{exc}", trace=traceback.format_exc())
+
+
+def bvh_to_fbx_bulk(src_dir: str = "", out_dir: str = "", paths: Optional[list] = None,
+                    global_scale: float = 0.01, axis_forward: str = "Z",
+                    axis_up: str = "Y", frame_start: int = 1) -> dict:
+    """Bulk-convert BVH->FBX. Provide ``paths`` (list of .bvh files) OR ``src_dir``
+    (globs every *.bvh in it). ``out_dir`` defaults to each file's own folder. Same
+    isolated-temp-scene conversion as ``bvh_to_fbx``. Returns per-file results."""
+    import glob as _glob
+    try:
+        if paths:
+            files = [bpy.path.abspath(p) for p in paths]
+        elif src_dir:
+            files = sorted(_glob.glob(os.path.join(bpy.path.abspath(src_dir), "*.bvh")))
+        else:
+            return _err("provide paths=[...] or src_dir=...")
+        if not files:
+            return _err("no .bvh files found")
+
+        od = ""
+        if out_dir:
+            od = bpy.path.abspath(out_dir)
+            os.makedirs(od, exist_ok=True)
+
+        results = []
+        for f in files:
+            out = os.path.join(od, os.path.splitext(os.path.basename(f))[0] + ".fbx") if od else ""
+            results.append(_bvh_to_fbx_one(f, out, global_scale, axis_forward, axis_up, frame_start))
+        converted = sum(1 for r in results if r.get("ok"))
+        return {"ok": converted > 0, "total": len(files), "converted": converted,
+                "results": results}
+    except Exception as exc:
+        return _err(f"{exc}", trace=traceback.format_exc())
+
+
+def bvh_to_fbx_combined(fbx: str, src_dir: str = "", paths: Optional[list] = None,
+                        global_scale: float = 0.01) -> dict:
+    """Combine many BVH clips into ONE multi-clip FBX (one shared skeleton, one named take
+    per clip -> Unity reads them as separate AnimationClips). Provide ``paths`` (a list of
+    .bvh) OR ``src_dir`` (every *.bvh in it). Runs a FRESH headless Blender (vendored
+    local/bvh2fbx/combine_fbx.py) so the take set is clean and the open scene is untouched."""
+    import glob as _glob
+    import subprocess
+    try:
+        if paths:
+            files = [bpy.path.abspath(p) for p in paths]
+        elif src_dir:
+            files = sorted(_glob.glob(os.path.join(bpy.path.abspath(src_dir), "*.bvh")))
+        else:
+            return _err("provide paths=[...] or src_dir=...")
+        files = [f for f in files if os.path.exists(f) and f.lower().endswith(".bvh")]
+        if not files:
+            return _err("no .bvh files found")
+        fbx = bpy.path.abspath(fbx)
+        os.makedirs(os.path.dirname(fbx) or ".", exist_ok=True)
+        script = os.path.normpath(os.path.join(
+            os.path.dirname(__file__), "..", "local", "bvh2fbx", "combine_fbx.py"))
+        if not os.path.exists(script):
+            return _err(f"combine script not found: {script}")
+        cmd = [bpy.app.binary_path, "-b", "--python", script, "--",
+               fbx, str(global_scale)] + files
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        ok = os.path.exists(fbx)
+        out = {"ok": ok, "fbx": fbx, "count": len(files),
+               "clips": [os.path.splitext(os.path.basename(f))[0] for f in files]}
+        if not ok:
+            out["error"] = "headless conversion produced no file"
+            out["stdout"] = proc.stdout[-800:]
+            out["stderr"] = proc.stderr[-800:]
+        return out
+    except Exception as exc:
+        return _err(f"{exc}", trace=traceback.format_exc())
+
+
 def _find_armature_in_scene():
     """Return the armature with the most children (the character rig), or None."""
     candidates = [o for o in bpy.data.objects if o.type == "ARMATURE"]

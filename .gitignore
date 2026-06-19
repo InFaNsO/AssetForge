@@ -26,6 +26,7 @@ venv/
 # --- Asset pipeline work dirs / generated artifacts ---
 /work/
 /out/
+/outputs/
 *.glb
 *.gltf
 !tests/golden/**/*.glb

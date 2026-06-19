@@ -338,9 +338,16 @@ def npz_to_blender_action(npz_path: str, armature_obj, action_name: str = "Kimod
             if root_pos.ndim == 3:
                 root_pos = root_pos[0]
             hips = pose.bones.get("Hips")
-            if root_pos is not None and hips is not None:
+            if hips is not None:
+                # Root motion is frame-0 relative so the rig doesn't teleport to the
+                # SOMA source origin on frame 1: X_root(t) = X_pelvis(t) − X_pelvis(0).
+                # The world-space delta is then mapped into the Hips rest basis, since
+                # a pose bone's location is expressed in its own local axes.
+                hips_basis_inv = rest["Hips"].matrix_local.to_3x3().inverted()
+                p0 = Vector(root_pos[0].tolist())
                 for t in range(T):
-                    hips.location = W @ Vector(root_pos[t].tolist())
+                    d_world = W @ (Vector(root_pos[t].tolist()) - p0)
+                    hips.location = hips_basis_inv @ d_world
                     hips.keyframe_insert("location", frame=t + 1)
 
     action.frame_range = (1, T)
